@@ -7,6 +7,55 @@ from psycopg2.extras import RealDictCursor
 
 st.set_page_config(page_title="Controle Logístico", page_icon="📦", layout="wide")
 
+# ── Overlay de guia para o scanner (injeta no DOM via iframe) ────────────────
+# Ativa somente quando há câmera de código de barras visível.
+st.components.v1.html("""
+<script>
+(function(){
+  function addGuide(){
+    // Busca todos os camera-inputs com label contendo 'barras'
+    var containers = window.parent.document.querySelectorAll('[data-testid="stCameraInput"]');
+    containers.forEach(function(c){
+      var lbl = c.querySelector('label');
+      if(!lbl || lbl.textContent.indexOf('barras') === -1) return;
+      var video = c.querySelector('video');
+      if(!video) return;
+      var wrap = video.parentElement;
+      if(wrap.querySelector('.berta-guide')) return;
+      wrap.style.position = 'relative';
+      var g = document.createElement('div');
+      g.className = 'berta-guide';
+      g.style.cssText = [
+        'position:absolute','top:0','left:0','width:100%','height:100%',
+        'pointer-events:none','z-index:99'
+      ].join(';');
+      // fundo escuro fora do retângulo de leitura
+      g.innerHTML =
+        '<svg width="100%" height="100%" xmlns="http://www.w3.org/2000/svg">' +
+          '<defs>' +
+            '<mask id="hole">' +
+              '<rect width="100%" height="100%" fill="white"/>' +
+              '<rect x="8%" y="22%" width="84%" height="56%" rx="6" fill="black"/>' +
+            '</mask>' +
+          '</defs>' +
+          '<rect width="100%" height="100%" fill="rgba(0,0,0,0.45)" mask="url(#hole)"/>' +
+          '<rect x="8%" y="22%" width="84%" height="56%" rx="6"' +
+               ' fill="none" stroke="#00cc66" stroke-width="2.5"/>' +
+          '<text x="50%" y="81%" text-anchor="middle"' +
+               ' font-family="sans-serif" font-size="11" fill="#00cc66">' +
+            'Centralize o código na área verde' +
+          '</text>' +
+        '</svg>';
+      wrap.appendChild(g);
+    });
+  }
+  addGuide();
+  new MutationObserver(addGuide)
+    .observe(window.parent.document.body, {childList:true, subtree:true});
+})();
+</script>
+""", height=0)
+
 # ── Conexão ─────────────────────────────────────────────────────────────────
 
 @st.cache_resource
@@ -68,26 +117,68 @@ def _historico(supervisor=None, tr=None):
     )
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Decode de código de barras (região central + fallbacks) ──────────────────
 
-def _decode_barcode(img_bytes):
+def _decode_barcode(img_bytes: bytes):
+    """Tenta decodificar código de barras com múltiplas estratégias."""
     try:
-        from pyzbar.pyzbar import decode as pz_decode
-        from PIL import Image as PILImage
-        codes = pz_decode(PILImage.open(io.BytesIO(img_bytes)))
-        return codes[0].data.decode("utf-8", errors="ignore") if codes else None
+        from pyzbar.pyzbar import decode as pz
+        from PIL import Image as PI, ImageEnhance
+
+        img = PI.open(io.BytesIO(img_bytes))
+        w, h = img.size
+
+        # Região central correspondente ao retângulo de guia (8% x, 22% y)
+        cx1, cy1 = int(w * 0.08), int(h * 0.22)
+        cx2, cy2 = int(w * 0.92), int(h * 0.78)
+        crop = img.crop((cx1, cy1, cx2, cy2))
+
+        # Estratégias em ordem de prioridade
+        candidates = [
+            crop,
+            crop.convert("L"),
+            ImageEnhance.Contrast(crop.convert("L")).enhance(2.5),
+            ImageEnhance.Sharpness(crop.convert("L")).enhance(3.0),
+            img,                          # imagem completa como fallback
+            img.convert("L"),
+        ]
+
+        for candidate in candidates:
+            codes = pz(candidate)
+            if codes:
+                return codes[0].data.decode("utf-8", errors="ignore")
+
+        return None
     except Exception:
         return None
 
-def _img_to_b64(file_like, mime="image/jpeg"):
-    data = file_like.read() if hasattr(file_like, "read") else file_like
-    return f"data:{mime};base64," + base64.b64encode(data).decode()
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _thumb(b64_str):
-    """Show small thumbnail."""
-    st.image(b64_str, width=160)
+def _img_to_b64(raw: bytes, mime="image/jpeg"):
+    return f"data:{mime};base64," + base64.b64encode(raw).decode()
 
-# ── Abas principais ─────────────────────────────────────────────────────────
+try:
+    from streamlit_js_eval import streamlit_js_eval as _js_eval
+    _HAS_GEO = True
+except ImportError:
+    _HAS_GEO = False
+
+def _get_geo(suffix: str):
+    if not _HAS_GEO:
+        return None
+    return _js_eval(
+        js_expressions=(
+            "new Promise(r => navigator.geolocation.getCurrentPosition("
+            "p => r({lat:p.coords.latitude.toFixed(6),"
+            "        lon:p.coords.longitude.toFixed(6),"
+            "        acc:Math.round(p.coords.accuracy),"
+            "        ts:new Date().toLocaleString('pt-BR')}),"
+            "() => r(null),{timeout:8000,enableHighAccuracy:true}))"
+        ),
+        key=f"geo_{suffix}",
+    )
+
+# ── Abas ────────────────────────────────────────────────────────────────────
 
 tab_nova, tab_hist = st.tabs(["📋 Nova Conferência", "📊 Histórico"])
 
@@ -97,10 +188,8 @@ tab_nova, tab_hist = st.tabs(["📋 Nova Conferência", "📊 Histórico"])
 with tab_nova:
     st.title("📋 Nova Conferência")
 
-    # ── Seleção de técnico ──────────────────────────────────────────────────
     sups = _supervisores()
     sup_sel = st.selectbox("Supervisor", [""] + sups, key="nova_sup")
-
     techs = _tecnicos(sup_sel) if sup_sel else []
     tech_map = {f"{r['nome']} ({r['tr']})": r for r in techs}
     tech_label = st.selectbox("Técnico", [""] + list(tech_map.keys()), key="nova_tec")
@@ -112,71 +201,50 @@ with tab_nova:
 
     c1, c2, c3, c4 = st.columns(4)
     c1.markdown(f"**TR:** {tech['tr']}")
-    c2.markdown(f"**Função:** {tech.get('tipo', '')}")
-    c3.markdown(f"**Operadora:** {tech.get('operadora', '')}")
-    c4.markdown(f"**Setor:** {tech.get('setor', '')}")
+    c2.markdown(f"**Função:** {tech.get('tipo','')}")
+    c3.markdown(f"**Operadora:** {tech.get('operadora','')}")
+    c4.markdown(f"**Setor:** {tech.get('setor','')}")
 
     st.divider()
     conferente = st.text_input("Nome do conferente *", key="nova_conf")
     n_itens = st.number_input("Quantidade de itens", min_value=1, max_value=10, value=1, step=1)
 
-    # ── Geolocalização via JS ───────────────────────────────────────────────
-    try:
-        from streamlit_js_eval import streamlit_js_eval as _js_eval
-        _HAS_GEO = True
-    except ImportError:
-        _HAS_GEO = False
-
-    def _get_geo(unique_suffix: str):
-        """Dispara JS de geolocalização; retorna dict ou None."""
-        if not _HAS_GEO:
-            return None
-        return _js_eval(
-            js_expressions=(
-                "new Promise(r => navigator.geolocation.getCurrentPosition("
-                "p => r({lat: p.coords.latitude.toFixed(6),"
-                "        lon: p.coords.longitude.toFixed(6),"
-                "        acc: Math.round(p.coords.accuracy),"
-                "        ts:  new Date().toLocaleString('pt-BR')}),"
-                "e => r(null), {timeout: 8000, enableHighAccuracy: true}))"
-            ),
-            key=f"geo_{unique_suffix}",
-        )
-
-    # ── Itens ───────────────────────────────────────────────────────────────
-    st.subheader("Itens")
-
-    # Inicializa session_state por item
+    # ── Inicializa estado dos itens ─────────────────────────────────────────
     for i in range(1, 11):
         st.session_state.setdefault(f"serial_{i}", "")
         st.session_state.setdefault(f"scan_on_{i}", False)
         st.session_state.setdefault(f"foto_b64_{i}", None)
-        st.session_state.setdefault(f"geo_{i}", None)
         st.session_state.setdefault(f"foto_hash_{i}", "")
+        st.session_state.setdefault(f"geo_{i}", None)
 
+    st.subheader("Itens")
     itens_state = []
+
     for i in range(1, int(n_itens) + 1):
         with st.expander(f"Item {i}", expanded=True):
 
             # ── Serial + botão scan ────────────────────────────────────────
             col_s, col_btn = st.columns([5, 1])
-            serial_input = col_s.text_input(
+            serial_val = col_s.text_input(
                 "Serial / código",
                 value=st.session_state[f"serial_{i}"],
                 key=f"si_{i}",
                 placeholder="Digite ou use 📷 para escanear",
             )
-            st.session_state[f"serial_{i}"] = serial_input
+            st.session_state[f"serial_{i}"] = serial_val
 
-            scan_label = "✖ Fechar" if st.session_state[f"scan_on_{i}"] else "📷 Scan"
-            if col_btn.button(scan_label, key=f"scanbtn_{i}"):
+            btn_lbl = "✖ Fechar" if st.session_state[f"scan_on_{i}"] else "📷 Scan"
+            if col_btn.button(btn_lbl, key=f"scanbtn_{i}"):
                 st.session_state[f"scan_on_{i}"] = not st.session_state[f"scan_on_{i}"]
                 st.rerun()
 
             if st.session_state[f"scan_on_{i}"]:
-                st.caption("Aponte a câmera para o código de barras e capture.")
-                scan_img = st.camera_input("Código de barras", key=f"scanimg_{i}",
-                                           label_visibility="collapsed")
+                # Label contém "barras" → JS injeta o overlay de guia
+                scan_img = st.camera_input(
+                    "Código de barras — centralize na área verde",
+                    key=f"scanimg_{i}",
+                    label_visibility="visible",
+                )
                 if scan_img:
                     raw = scan_img.read()
                     decoded = _decode_barcode(raw)
@@ -198,17 +266,18 @@ with tab_nova:
             )
 
             if "Câmera" in foto_src:
-                foto_cam = st.camera_input("Tirar foto", key=f"fotocam_{i}",
-                                           label_visibility="collapsed")
+                foto_cam = st.camera_input(
+                    "Foto do equipamento",
+                    key=f"fotocam_{i}",
+                    label_visibility="collapsed",
+                )
                 if foto_cam:
                     raw_foto = foto_cam.read()
-                    foto_h = hashlib.md5(raw_foto).hexdigest()[:10]
-                    if foto_h != st.session_state[f"foto_hash_{i}"]:
-                        st.session_state[f"foto_b64_{i}"] = _img_to_b64(io.BytesIO(raw_foto))
-                        st.session_state[f"foto_hash_{i}"] = foto_h
-                        st.session_state[f"geo_{i}"] = None  # reset geo para nova foto
-
-                    # Geolocalização automática (key muda com a foto → JS roda de novo)
+                    fh = hashlib.md5(raw_foto).hexdigest()[:10]
+                    if fh != st.session_state[f"foto_hash_{i}"]:
+                        st.session_state[f"foto_b64_{i}"] = _img_to_b64(raw_foto)
+                        st.session_state[f"foto_hash_{i}"] = fh
+                        st.session_state[f"geo_{i}"] = None
                     if st.session_state[f"foto_hash_{i}"]:
                         geo = _get_geo(f"{i}_{st.session_state[f'foto_hash_{i}']}")
                         if geo and "lat" in geo:
@@ -220,25 +289,22 @@ with tab_nova:
                     key=f"fotoup_{i}", label_visibility="collapsed",
                 )
                 if upload:
-                    st.session_state[f"foto_b64_{i}"] = _img_to_b64(upload)
+                    st.session_state[f"foto_b64_{i}"] = _img_to_b64(upload.read())
                     st.session_state[f"geo_{i}"] = None
             else:
                 st.session_state[f"foto_b64_{i}"] = None
                 st.session_state[f"geo_{i}"] = None
 
-            # Prévia + geo
             if st.session_state[f"foto_b64_{i}"]:
-                _thumb(st.session_state[f"foto_b64_{i}"])
+                st.image(st.session_state[f"foto_b64_{i}"], width=180)
                 g = st.session_state[f"geo_{i}"]
                 if g and "lat" in g:
                     maps = f"https://www.google.com/maps?q={g['lat']},{g['lon']}"
-                    st.caption(f"📍 {g['lat']}, {g['lon']} · {g['ts']} · [Abrir mapa]({maps})")
+                    st.caption(f"📍 {g['lat']}, {g['lon']} · {g['ts']} · [ver mapa]({maps})")
                 elif "Câmera" in foto_src:
-                    st.caption("⏳ Aguardando localização…")
+                    st.caption("⏳ Obtendo localização…")
 
-            # ── Verificado ─────────────────────────────────────────────────
             verificado = st.checkbox("✅ Item verificado", key=f"veri_{i}")
-
             itens_state.append({
                 "id": i,
                 "serial": st.session_state[f"serial_{i}"],
@@ -264,15 +330,15 @@ with tab_nova:
             cv_c = st_canvas(stroke_width=2, height=130, background_color="#fff",
                              key="sig_conf", update_streamlit=False)
 
-        def _canvas_b64(canvas):
-            if canvas is None or canvas.image_data is None:
+        def _c2b64(cv):
+            if cv is None or cv.image_data is None:
                 return None
-            img = PILImage.fromarray(canvas.image_data.astype("uint8"), "RGBA")
-            buf = io.BytesIO(); img.save(buf, format="PNG")
+            buf = io.BytesIO()
+            PILImage.fromarray(cv.image_data.astype("uint8"), "RGBA").save(buf, format="PNG")
             return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
-        assin_tec = _canvas_b64(cv_t)
-        assin_conf = _canvas_b64(cv_c)
+        assin_tec  = _c2b64(cv_t)
+        assin_conf = _c2b64(cv_c)
     except ImportError:
         st.info("Assinaturas indisponíveis (streamlit-drawable-canvas não instalado).")
 
@@ -284,14 +350,11 @@ with tab_nova:
             "INSERT INTO conferencias_logisticas"
             " (tr, tecnico_nome, supervisor, setor, conferente, itens, assin_tecnico, assin_conferente)"
             " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-            (
-                tech["tr"], tech["nome"], tech.get("supervisor"), tech.get("setor"),
-                conferente.strip(), json.dumps(itens_state), assin_tec, assin_conf,
-            ),
+            (tech["tr"], tech["nome"], tech.get("supervisor"), tech.get("setor"),
+             conferente.strip(), json.dumps(itens_state), assin_tec, assin_conf),
         )
         if ok:
-            st.success("✅ Conferência salva com sucesso!")
-            # Limpa estado dos itens
+            st.success("✅ Conferência salva!")
             for i in range(1, 11):
                 for k in (f"serial_{i}", f"foto_b64_{i}", f"geo_{i}", f"foto_hash_{i}"):
                     st.session_state.pop(k, None)
@@ -318,10 +381,7 @@ with tab_hist:
             st.cache_data.clear()
             st.rerun()
 
-    df = _historico(
-        supervisor=sup_h if sup_h != "Todos" else None,
-        tr=tec_tr_h,
-    )
+    df = _historico(supervisor=sup_h if sup_h != "Todos" else None, tr=tec_tr_h)
 
     if df.empty:
         st.info("Nenhuma conferência ainda. Use a aba 'Nova Conferência' para criar.")
@@ -334,8 +394,8 @@ with tab_hist:
     c4.metric("Conferentes", df["conferente"].nunique())
 
     st.divider()
-    df_show = df[["data_conf", "tr", "tecnico_nome", "supervisor", "setor", "conferente"]].copy()
-    df_show.columns = ["Data/Hora", "TR", "Técnico", "Supervisor", "Setor", "Conferente"]
+    df_show = df[["data_conf","tr","tecnico_nome","supervisor","setor","conferente"]].copy()
+    df_show.columns = ["Data/Hora","TR","Técnico","Supervisor","Setor","Conferente"]
     df_show["Data/Hora"] = pd.to_datetime(df_show["Data/Hora"]).dt.strftime("%d/%m/%Y %H:%M")
 
     sel = st.dataframe(df_show, use_container_width=True, hide_index=True,
@@ -351,24 +411,19 @@ with tab_hist:
         col_a.markdown(f"**Supervisor:** {row['supervisor']}")
         col_b.markdown(f"**Setor:** {row['setor'] or '—'}")
         col_b.markdown(f"**Data:** {str(row['data_conf'])[:16]}")
-
         itens_raw = row.get("itens")
         if itens_raw:
             try:
                 itens = itens_raw if isinstance(itens_raw, list) else json.loads(itens_raw)
                 rows_it = []
                 for it in itens:
-                    geo = it.get("geo") or {}
-                    maps_link = (
-                        f"[📍]( https://www.google.com/maps?q={geo['lat']},{geo['lon']})"
-                        if geo.get("lat") else "—"
-                    )
+                    g = it.get("geo") or {}
                     rows_it.append({
                         "#": it.get("id"),
                         "Serial": it.get("serial") or "—",
                         "Verificado": "✅" if it.get("verificado") else "❌",
-                        "Localização": f"{geo.get('lat','')}, {geo.get('lon','')}" if geo.get("lat") else "—",
-                        "Data/Hora foto": geo.get("ts", "—"),
+                        "Localização": f"{g['lat']}, {g['lon']}" if g.get("lat") else "—",
+                        "Data/Hora foto": g.get("ts", "—"),
                     })
                 df_it = pd.DataFrame(rows_it)
                 ok_n = (df_it["Verificado"] == "✅").sum()
