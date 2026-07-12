@@ -8,6 +8,8 @@ dependencies = [
     "streamlit>=1.59.1",
     "psycopg2-binary",
     "pandas",
+    "streamlit-drawable-canvas",
+    "Pillow",
 ]
 
 [tool.uv]
