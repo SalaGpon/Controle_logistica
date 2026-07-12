@@ -21,7 +21,6 @@ except ImportError:
 # resolvendo o Promise de streamlit_js_eval.
 _SCANNER_JS = """
 new Promise(function(RESOLVE){
-  var IW=window;
   var PD=window.parent.document;
   var old=PD.getElementById('_bscan'); if(old)old.remove();
   var ROOT=PD.createElement('div');
@@ -37,55 +36,68 @@ new Promise(function(RESOLVE){
   VWRAP.appendChild(VID); VWRAP.appendChild(OV);
   var ST=PD.createElement('div');
   ST.style.cssText='padding:5px 12px;text-align:center;font-size:12px;color:#00e676;background:rgba(0,0,0,.8);';
-  ST.textContent='\\ud83d\\udd0d Procurando c\\u00f3digo...';
+  ST.textContent='Procurando codigo...';
   var ZBAR=PD.createElement('div');
   ZBAR.style.cssText='background:#111;padding:6px 12px;display:flex;align-items:center;gap:8px;';
-  ZBAR.innerHTML='<span style="color:#64748b;font-size:11px;">\\ud83d\\udd0d\\u2212</span><input id="_bzmr" type="range" min="1" max="100" value="20" style="flex:1;accent-color:#00e676;"><span style="color:#64748b;font-size:11px;">+</span>';
+  ZBAR.innerHTML='<span style="color:#64748b;font-size:11px;">Zoom:</span><input id="_bzmr" type="range" min="1" max="100" value="20" style="flex:1;accent-color:#00e676;"><span style="color:#64748b;font-size:11px;">+</span>';
   var BTNS=PD.createElement('div');
   BTNS.style.display='flex';
   var BOCR=PD.createElement('button');
-  BOCR.textContent='\\ud83d\\udd24 OCR';
-  BOCR.style.cssText='flex:1;padding:11px;background:#1d4ed8;color:#fff;border:none;font-size:13px;font-weight:600;cursor:pointer;';
+  BOCR.textContent='OCR';
+  BOCR.style.cssText='flex:1;padding:11px;background:#1d4ed8;color:#fff;border:none;font-size:14px;font-weight:700;cursor:pointer;letter-spacing:.5px;';
   var BCAN=PD.createElement('button');
-  BCAN.textContent='\\u2716 Cancelar';
-  BCAN.style.cssText='flex:1;padding:11px;background:#374151;color:#fff;border:none;font-size:13px;font-weight:600;cursor:pointer;';
+  BCAN.textContent='Cancelar';
+  BCAN.style.cssText='flex:1;padding:11px;background:#374151;color:#fff;border:none;font-size:14px;font-weight:700;cursor:pointer;';
   BTNS.appendChild(BOCR); BTNS.appendChild(BCAN);
   ROOT.appendChild(VWRAP); ROOT.appendChild(ST); ROOT.appendChild(ZBAR); ROOT.appendChild(BTNS);
   PD.body.appendChild(ROOT);
-  var stream,scanT,animT,GR={},found=false,LY=0,LD=1;
-  var CAP=PD.createElement('canvas');
+
+  // CAP, jsQR e Tesseract carregam no IFRAME (sem CSP da pagina pai)
+  var CAP=document.createElement('canvas');
+  var stream,scanT,animT,GR={},found=false,LY=0,LD=1,qrFn=null;
+
   function DONE(v){
     found=true; clearInterval(scanT); clearInterval(animT);
     if(stream) stream.getTracks().forEach(function(t){t.stop();});
     ROOT.remove();
-    IW.postMessage({_bscanRes:v},'*');
+    window.postMessage({_bscanRes:v},'*');
   }
-  IW.addEventListener('message',function H(e){
-    if(e.data&&e.data._bscanRes!==undefined){IW.removeEventListener('message',H); RESOLVE(e.data._bscanRes);}
+  window.addEventListener('message',function H(e){
+    if(e.data&&e.data._bscanRes!==undefined){window.removeEventListener('message',H); RESOLVE(e.data._bscanRes);}
   });
+
   navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1920}}})
   .then(function(s){stream=s; VID.srcObject=s; return VID.play();})
   .then(function(){
     setTimeout(RZ,200); animT=setInterval(DRAW,30);
     setTimeout(function(){
-      loadQR(function(QR){
-        scanT=setInterval(function(){
-          if(found||!VID.videoWidth||!GR.vw) return;
-          var cv=CROP();
-          if(QR){
-            var d=cv.getContext('2d').getImageData(0,0,cv.width,cv.height);
-            var q=QR(d.data,d.width,d.height,{inversionAttempts:'dontInvert'});
-            if(q&&!found){DONE({type:'barcode',value:q.data}); return;}
-          }
-          if('BarcodeDetector' in window.parent){
-            new window.parent.BarcodeDetector().detect(cv)
-              .then(function(cs){if(cs.length&&!found)DONE({type:'barcode',value:cs[0].rawValue});})
-              .catch(function(){});
-          }
-        },200);
-      });
+      loadQR(function(QR){ qrFn=QR; startScan(); });
     },300);
-  }).catch(function(e){ST.textContent='\\u274c C\\u00e2mera: '+e.message; ST.style.color='#ef4444';});
+  }).catch(function(e){ST.textContent='Erro camera: '+e.message; ST.style.color='#ef4444';});
+
+  function startScan(){
+    clearInterval(scanT);
+    ST.textContent='Procurando codigo...'; ST.style.color='#00e676';
+    scanT=setInterval(function(){
+      if(found||!VID.videoWidth||!GR.vw) return;
+      var cv=CROP();
+      if(qrFn){
+        var d=cv.getContext('2d').getImageData(0,0,cv.width,cv.height);
+        var q=qrFn(d.data,d.width,d.height,{inversionAttempts:'dontInvert'});
+        if(q&&!found){DONE({type:'barcode',value:q.data}); return;}
+      }
+      if('BarcodeDetector' in window){
+        new BarcodeDetector().detect(cv)
+          .then(function(cs){if(cs.length&&!found)DONE({type:'barcode',value:cs[0].rawValue});})
+          .catch(function(){});
+      } else if('BarcodeDetector' in window.parent){
+        new window.parent.BarcodeDetector().detect(cv)
+          .then(function(cs){if(cs.length&&!found)DONE({type:'barcode',value:cs[0].rawValue});})
+          .catch(function(){});
+      }
+    },200);
+  }
+
   function RZ(){
     var r=VID.getBoundingClientRect(); if(!r.width)return;
     OV.width=r.width; OV.height=r.height;
@@ -110,7 +122,7 @@ new Promise(function(RESOLVE){
       LY+=LD*3; if(LY>=GR.h)LD=-1; if(LY<=0)LD=1;
     }
     c.fillStyle='rgba(0,230,118,.9)'; c.font='11px sans-serif'; c.textAlign='center';
-    c.fillText('Centralize o c\\u00f3digo aqui',GR.vw/2,GR.y+GR.h+14);
+    c.fillText('Centralize o codigo aqui',GR.vw/2,GR.y+GR.h+14);
   }
   function CROP(){
     var sx=VID.videoWidth/GR.vw,sy=VID.videoHeight/GR.vh;
@@ -118,34 +130,50 @@ new Promise(function(RESOLVE){
     CAP.getContext('2d').drawImage(VID,Math.round(GR.x*sx),Math.round(GR.y*sy),CAP.width,CAP.height,0,0,CAP.width,CAP.height);
     return CAP;
   }
-  function loadQR(cb){
-    if(window.parent.jsQR){cb(window.parent.jsQR); return;}
-    var s=PD.createElement('script');
-    s.src='https://unpkg.com/jsqr@1.4.0/dist/jsQR.min.js';
-    s.onload=function(){cb(window.parent.jsQR||null);}; s.onerror=function(){cb(null);};
-    PD.head.appendChild(s);
+  function CROP_FULL(){
+    var cv=document.createElement('canvas');
+    cv.width=VID.videoWidth||640; cv.height=VID.videoHeight||480;
+    cv.getContext('2d').drawImage(VID,0,0);
+    return cv;
   }
+  function loadQR(cb){
+    if(window.jsQR){cb(window.jsQR); return;}
+    var s=document.createElement('script');
+    s.src='https://unpkg.com/jsqr@1.4.0/dist/jsQR.min.js';
+    s.onload=function(){cb(window.jsQR||null);}; s.onerror=function(){cb(null);};
+    document.head.appendChild(s);
+  }
+
   BOCR.addEventListener('click',async function(){
     clearInterval(scanT);
-    ST.textContent='\\ud83d\\udd24 Carregando OCR...';
-    var cv=CROP(); var dataUrl=cv.toDataURL('image/jpeg',.95);
-    var Tes=window.parent.Tesseract;
+    ST.textContent='Carregando OCR...'; ST.style.color='#00e676';
+    var dataUrl=CROP_FULL().toDataURL('image/jpeg',.95);
+    var Tes=window.Tesseract;
     if(!Tes){
-      await new Promise(function(res){
-        var s=PD.createElement('script');
-        s.src='https://unpkg.com/tesseract.js@5/dist/tesseract.min.js';
-        s.onload=res; PD.head.appendChild(s);
-      });
-      Tes=window.parent.Tesseract;
+      try{
+        await new Promise(function(res,rej){
+          var s=document.createElement('script');
+          s.src='https://unpkg.com/tesseract.js@5/dist/tesseract.min.js';
+          s.onload=res; s.onerror=function(){rej(new Error('CDN bloqueado'));};
+          document.head.appendChild(s);
+        });
+        Tes=window.Tesseract;
+      }catch(le){
+        ST.textContent='Erro OCR: '+le.message; ST.style.color='#ef4444';
+        startScan(); return;
+      }
     }
-    ST.textContent='\\ud83d\\udd24 Processando...';
+    if(!Tes){ST.textContent='OCR indisponivel'; ST.style.color='#ef4444'; startScan(); return;}
+    ST.textContent='Processando OCR...';
     try{
       var w=await Tes.createWorker('eng');
       var r=await w.recognize(dataUrl); await w.terminate();
       var txt=r.data.text.replace(/\\s+/g,' ').trim();
       if(txt){DONE({type:'ocr',value:txt});}
-      else{ST.textContent='\\u26a0\\ufe0f Nenhum texto detectado.'; ST.style.color='#f59e0b';}
-    }catch(e){ST.textContent='\\u274c OCR: '+e.message; ST.style.color='#ef4444';}
+      else{ST.textContent='Sem texto detectado. Ajuste zoom.'; ST.style.color='#f59e0b'; startScan();}
+    }catch(e){
+      ST.textContent='Erro OCR: '+e.message; ST.style.color='#ef4444'; startScan();
+    }
   });
   PD.getElementById('_bzmr').addEventListener('input',async function(){
     if(!stream)return;
@@ -154,7 +182,7 @@ new Promise(function(RESOLVE){
     if(cap.zoom){var z=cap.zoom; await track.applyConstraints({advanced:[{zoom:z.min+(z.max-z.min)*(this.value/100)}]}).catch(function(){});}
   });
   BCAN.addEventListener('click',function(){DONE({type:'cancel'});});
-  IW.addEventListener('resize',RZ);
+  window.addEventListener('resize',RZ);
 })
 """
 
