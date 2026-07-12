@@ -1,21 +1,162 @@
 """Controle Logístico — verificação de equipamentos e histórico"""
 import base64, hashlib, io, json, os
 import streamlit as st
-import streamlit.components.v1 as stc
 import pandas as pd
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 st.set_page_config(page_title="Controle Logístico", page_icon="📦", layout="wide")
 
-# ── Componente de scanner (câmera ao vivo + BarcodeDetector + jsQR + OCR) ───
-_COMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "components", "barcode_scanner")
-_scanner_component = stc.declare_component("barcode_scanner", path=_COMP_DIR)
+# ── JS eval (scanner + geo) ─────────────────────────────────────────────────
+try:
+    from streamlit_js_eval import streamlit_js_eval as _js_eval
+    _HAS_JS = True
+except ImportError:
+    _HAS_JS = False
+    def _js_eval(*a, **kw): return None
 
-def barcode_scanner(key=None):
-    """Retorna dict {type, value} ou None."""
-    return _scanner_component(key=key, default=None)
+# ── Scanner JS ───────────────────────────────────────────────────────────────
+# Injeta overlay full-screen na página pai, acessa câmera via navigator do
+# iframe (que tem allow="camera"), e devolve resultado via window.postMessage
+# resolvendo o Promise de streamlit_js_eval.
+_SCANNER_JS = """
+new Promise(function(RESOLVE){
+  var IW=window;
+  var PD=window.parent.document;
+  var old=PD.getElementById('_bscan'); if(old)old.remove();
+  var ROOT=PD.createElement('div');
+  ROOT.id='_bscan';
+  ROOT.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;background:#000;z-index:2147483647;display:flex;flex-direction:column;font-family:-apple-system,sans-serif;';
+  var VWRAP=PD.createElement('div');
+  VWRAP.style.cssText='position:relative;flex:1;min-height:0;overflow:hidden;';
+  var VID=PD.createElement('video');
+  VID.autoplay=true; VID.playsInline=true; VID.muted=true;
+  VID.style.cssText='width:100%;height:100%;object-fit:cover;display:block;';
+  var OV=PD.createElement('canvas');
+  OV.style.cssText='position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;';
+  VWRAP.appendChild(VID); VWRAP.appendChild(OV);
+  var ST=PD.createElement('div');
+  ST.style.cssText='padding:5px 12px;text-align:center;font-size:12px;color:#00e676;background:rgba(0,0,0,.8);';
+  ST.textContent='\\ud83d\\udd0d Procurando c\\u00f3digo...';
+  var ZBAR=PD.createElement('div');
+  ZBAR.style.cssText='background:#111;padding:6px 12px;display:flex;align-items:center;gap:8px;';
+  ZBAR.innerHTML='<span style="color:#64748b;font-size:11px;">\\ud83d\\udd0d\\u2212</span><input id="_bzmr" type="range" min="1" max="100" value="20" style="flex:1;accent-color:#00e676;"><span style="color:#64748b;font-size:11px;">+</span>';
+  var BTNS=PD.createElement('div');
+  BTNS.style.display='flex';
+  var BOCR=PD.createElement('button');
+  BOCR.textContent='\\ud83d\\udd24 OCR';
+  BOCR.style.cssText='flex:1;padding:11px;background:#1d4ed8;color:#fff;border:none;font-size:13px;font-weight:600;cursor:pointer;';
+  var BCAN=PD.createElement('button');
+  BCAN.textContent='\\u2716 Cancelar';
+  BCAN.style.cssText='flex:1;padding:11px;background:#374151;color:#fff;border:none;font-size:13px;font-weight:600;cursor:pointer;';
+  BTNS.appendChild(BOCR); BTNS.appendChild(BCAN);
+  ROOT.appendChild(VWRAP); ROOT.appendChild(ST); ROOT.appendChild(ZBAR); ROOT.appendChild(BTNS);
+  PD.body.appendChild(ROOT);
+  var stream,scanT,animT,GR={},found=false,LY=0,LD=1;
+  var CAP=PD.createElement('canvas');
+  function DONE(v){
+    found=true; clearInterval(scanT); clearInterval(animT);
+    if(stream) stream.getTracks().forEach(function(t){t.stop();});
+    ROOT.remove();
+    IW.postMessage({_bscanRes:v},'*');
+  }
+  IW.addEventListener('message',function H(e){
+    if(e.data&&e.data._bscanRes!==undefined){IW.removeEventListener('message',H); RESOLVE(e.data._bscanRes);}
+  });
+  navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1920}}})
+  .then(function(s){stream=s; VID.srcObject=s; return VID.play();})
+  .then(function(){
+    setTimeout(RZ,200); animT=setInterval(DRAW,30);
+    setTimeout(function(){
+      loadQR(function(QR){
+        scanT=setInterval(function(){
+          if(found||!VID.videoWidth||!GR.vw) return;
+          var cv=CROP();
+          if(QR){
+            var d=cv.getContext('2d').getImageData(0,0,cv.width,cv.height);
+            var q=QR(d.data,d.width,d.height,{inversionAttempts:'dontInvert'});
+            if(q&&!found){DONE({type:'barcode',value:q.data}); return;}
+          }
+          if('BarcodeDetector' in window.parent){
+            new window.parent.BarcodeDetector().detect(cv)
+              .then(function(cs){if(cs.length&&!found)DONE({type:'barcode',value:cs[0].rawValue});})
+              .catch(function(){});
+          }
+        },200);
+      });
+    },300);
+  }).catch(function(e){ST.textContent='\\u274c C\\u00e2mera: '+e.message; ST.style.color='#ef4444';});
+  function RZ(){
+    var r=VID.getBoundingClientRect(); if(!r.width)return;
+    OV.width=r.width; OV.height=r.height;
+    var gw=Math.round(r.width*.68),gh=Math.round(r.height*.28);
+    GR={x:Math.round((r.width-gw)/2),y:Math.round((r.height-gh)/2),w:gw,h:gh,vw:r.width,vh:r.height};
+  }
+  function DRAW(){
+    if(!GR.vw)return;
+    var c=OV.getContext('2d');
+    c.clearRect(0,0,OV.width,OV.height);
+    c.fillStyle='rgba(0,0,0,.55)'; c.fillRect(0,0,GR.vw,GR.vh);
+    c.clearRect(GR.x,GR.y,GR.w,GR.h);
+    c.strokeStyle='#00e676'; c.lineWidth=1.5; c.strokeRect(GR.x,GR.y,GR.w,GR.h);
+    var cs=14; c.lineWidth=3;
+    [[GR.x,GR.y,1,1],[GR.x+GR.w,GR.y,-1,1],[GR.x,GR.y+GR.h,1,-1],[GR.x+GR.w,GR.y+GR.h,-1,-1]].forEach(function(p){
+      c.beginPath(); c.moveTo(p[0]+p[2]*cs,p[1]); c.lineTo(p[0],p[1]); c.lineTo(p[0],p[1]+p[3]*cs); c.stroke();
+    });
+    if(!found){
+      var ly=GR.y+LY,g2=c.createLinearGradient(0,ly-3,0,ly+3);
+      g2.addColorStop(0,'transparent'); g2.addColorStop(.5,'rgba(0,230,118,.65)'); g2.addColorStop(1,'transparent');
+      c.fillStyle=g2; c.fillRect(GR.x+2,ly-3,GR.w-4,6);
+      LY+=LD*3; if(LY>=GR.h)LD=-1; if(LY<=0)LD=1;
+    }
+    c.fillStyle='rgba(0,230,118,.9)'; c.font='11px sans-serif'; c.textAlign='center';
+    c.fillText('Centralize o c\\u00f3digo aqui',GR.vw/2,GR.y+GR.h+14);
+  }
+  function CROP(){
+    var sx=VID.videoWidth/GR.vw,sy=VID.videoHeight/GR.vh;
+    CAP.width=Math.round(GR.w*sx); CAP.height=Math.round(GR.h*sy);
+    CAP.getContext('2d').drawImage(VID,Math.round(GR.x*sx),Math.round(GR.y*sy),CAP.width,CAP.height,0,0,CAP.width,CAP.height);
+    return CAP;
+  }
+  function loadQR(cb){
+    if(window.parent.jsQR){cb(window.parent.jsQR); return;}
+    var s=PD.createElement('script');
+    s.src='https://unpkg.com/jsqr@1.4.0/dist/jsQR.min.js';
+    s.onload=function(){cb(window.parent.jsQR||null);}; s.onerror=function(){cb(null);};
+    PD.head.appendChild(s);
+  }
+  BOCR.addEventListener('click',async function(){
+    clearInterval(scanT);
+    ST.textContent='\\ud83d\\udd24 Carregando OCR...';
+    var cv=CROP(); var dataUrl=cv.toDataURL('image/jpeg',.95);
+    var Tes=window.parent.Tesseract;
+    if(!Tes){
+      await new Promise(function(res){
+        var s=PD.createElement('script');
+        s.src='https://unpkg.com/tesseract.js@5/dist/tesseract.min.js';
+        s.onload=res; PD.head.appendChild(s);
+      });
+      Tes=window.parent.Tesseract;
+    }
+    ST.textContent='\\ud83d\\udd24 Processando...';
+    try{
+      var w=await Tes.createWorker('eng');
+      var r=await w.recognize(dataUrl); await w.terminate();
+      var txt=r.data.text.replace(/\\s+/g,' ').trim();
+      if(txt){DONE({type:'ocr',value:txt});}
+      else{ST.textContent='\\u26a0\\ufe0f Nenhum texto detectado.'; ST.style.color='#f59e0b';}
+    }catch(e){ST.textContent='\\u274c OCR: '+e.message; ST.style.color='#ef4444';}
+  });
+  PD.getElementById('_bzmr').addEventListener('input',async function(){
+    if(!stream)return;
+    var track=stream.getVideoTracks()[0];
+    var cap=track.getCapabilities?track.getCapabilities():{};
+    if(cap.zoom){var z=cap.zoom; await track.applyConstraints({advanced:[{zoom:z.min+(z.max-z.min)*(this.value/100)}]}).catch(function(){});}
+  });
+  BCAN.addEventListener('click',function(){DONE({type:'cancel'});});
+  IW.addEventListener('resize',RZ);
+})
+"""
 
 # ── Conexão ─────────────────────────────────────────────────────────────────
 
@@ -83,14 +224,8 @@ def _historico(supervisor=None, tr=None):
 def _img_to_b64(raw: bytes, mime="image/jpeg"):
     return f"data:{mime};base64," + base64.b64encode(raw).decode()
 
-try:
-    from streamlit_js_eval import streamlit_js_eval as _js_eval
-    _HAS_GEO = True
-except ImportError:
-    _HAS_GEO = False
-
 def _get_geo(suffix: str):
-    if not _HAS_GEO:
+    if not _HAS_JS:
         return None
     return _js_eval(
         js_expressions=(
@@ -139,6 +274,7 @@ with tab_nova:
     for i in range(1, 11):
         st.session_state.setdefault(f"serial_{i}", "")
         st.session_state.setdefault(f"scan_on_{i}", False)
+        st.session_state.setdefault(f"scan_cnt_{i}", 0)
         st.session_state.setdefault(f"foto_b64_{i}", None)
         st.session_state.setdefault(f"foto_hash_{i}", "")
         st.session_state.setdefault(f"geo_{i}", None)
@@ -161,15 +297,18 @@ with tab_nova:
 
             btn_lbl = "✖ Fechar" if st.session_state[f"scan_on_{i}"] else "📷 Scan"
             if col_btn.button(btn_lbl, key=f"scanbtn_{i}"):
+                if not st.session_state[f"scan_on_{i}"]:
+                    st.session_state[f"scan_cnt_{i}"] += 1
                 st.session_state[f"scan_on_{i}"] = not st.session_state[f"scan_on_{i}"]
                 st.rerun()
 
-            if st.session_state[f"scan_on_{i}"]:
-                result = barcode_scanner(key=f"scanner_{i}")
+            if st.session_state[f"scan_on_{i}"] and _HAS_JS:
+                scan_key = f"scan_{i}_{st.session_state[f'scan_cnt_{i}']}"
+                result = _js_eval(js_expressions=_SCANNER_JS, key=scan_key)
                 if result is not None:
                     st.session_state[f"scan_on_{i}"] = False
-                    rtype = result.get("type", "")
-                    rval  = (result.get("value") or "").strip()
+                    rtype = (result.get("type") or "") if isinstance(result, dict) else ""
+                    rval  = (result.get("value") or "").strip() if isinstance(result, dict) else ""
                     if rtype in ("barcode", "ocr") and rval:
                         st.session_state[f"serial_{i}"] = rval
                     st.rerun()
@@ -278,6 +417,7 @@ with tab_nova:
                 for k in (f"serial_{i}", f"foto_b64_{i}", f"geo_{i}", f"foto_hash_{i}"):
                     st.session_state.pop(k, None)
                 st.session_state[f"scan_on_{i}"] = False
+                st.session_state[f"scan_cnt_{i}"] = 0
             st.cache_data.clear()
 
 
