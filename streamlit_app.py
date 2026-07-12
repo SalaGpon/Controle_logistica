@@ -1,60 +1,21 @@
 """Controle Logístico — verificação de equipamentos e histórico"""
-import base64, hashlib, io, json
+import base64, hashlib, io, json, os
 import streamlit as st
+import streamlit.components.v1 as stc
 import pandas as pd
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 st.set_page_config(page_title="Controle Logístico", page_icon="📦", layout="wide")
 
-# ── Overlay de guia para o scanner (injeta no DOM via iframe) ────────────────
-# Ativa somente quando há câmera de código de barras visível.
-st.components.v1.html("""
-<script>
-(function(){
-  function addGuide(){
-    // Busca todos os camera-inputs com label contendo 'barras'
-    var containers = window.parent.document.querySelectorAll('[data-testid="stCameraInput"]');
-    containers.forEach(function(c){
-      var lbl = c.querySelector('label');
-      if(!lbl || lbl.textContent.indexOf('barras') === -1) return;
-      var video = c.querySelector('video');
-      if(!video) return;
-      var wrap = video.parentElement;
-      if(wrap.querySelector('.berta-guide')) return;
-      wrap.style.position = 'relative';
-      var g = document.createElement('div');
-      g.className = 'berta-guide';
-      g.style.cssText = [
-        'position:absolute','top:0','left:0','width:100%','height:100%',
-        'pointer-events:none','z-index:99'
-      ].join(';');
-      // fundo escuro fora do retângulo de leitura
-      g.innerHTML =
-        '<svg width="100%" height="100%" xmlns="http://www.w3.org/2000/svg">' +
-          '<defs>' +
-            '<mask id="hole">' +
-              '<rect width="100%" height="100%" fill="white"/>' +
-              '<rect x="8%" y="22%" width="84%" height="56%" rx="6" fill="black"/>' +
-            '</mask>' +
-          '</defs>' +
-          '<rect width="100%" height="100%" fill="rgba(0,0,0,0.45)" mask="url(#hole)"/>' +
-          '<rect x="8%" y="22%" width="84%" height="56%" rx="6"' +
-               ' fill="none" stroke="#00cc66" stroke-width="2.5"/>' +
-          '<text x="50%" y="81%" text-anchor="middle"' +
-               ' font-family="sans-serif" font-size="11" fill="#00cc66">' +
-            'Centralize o código na área verde' +
-          '</text>' +
-        '</svg>';
-      wrap.appendChild(g);
-    });
-  }
-  addGuide();
-  new MutationObserver(addGuide)
-    .observe(window.parent.document.body, {childList:true, subtree:true});
-})();
-</script>
-""", height=0)
+# ── Componente de scanner (câmera ao vivo + BarcodeDetector + jsQR + OCR) ───
+_COMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "components", "barcode_scanner")
+_scanner_component = stc.declare_component("barcode_scanner", path=_COMP_DIR)
+
+def barcode_scanner(key=None):
+    """Retorna dict {type, value} ou None."""
+    return _scanner_component(key=key, default=None)
 
 # ── Conexão ─────────────────────────────────────────────────────────────────
 
@@ -116,41 +77,6 @@ def _historico(supervisor=None, tr=None):
         params,
     )
     return pd.DataFrame(rows) if rows else pd.DataFrame()
-
-# ── Decode de código de barras (região central + fallbacks) ──────────────────
-
-def _decode_barcode(img_bytes: bytes):
-    """Tenta decodificar código de barras com múltiplas estratégias."""
-    try:
-        from pyzbar.pyzbar import decode as pz
-        from PIL import Image as PI, ImageEnhance
-
-        img = PI.open(io.BytesIO(img_bytes))
-        w, h = img.size
-
-        # Região central correspondente ao retângulo de guia (8% x, 22% y)
-        cx1, cy1 = int(w * 0.08), int(h * 0.22)
-        cx2, cy2 = int(w * 0.92), int(h * 0.78)
-        crop = img.crop((cx1, cy1, cx2, cy2))
-
-        # Estratégias em ordem de prioridade
-        candidates = [
-            crop,
-            crop.convert("L"),
-            ImageEnhance.Contrast(crop.convert("L")).enhance(2.5),
-            ImageEnhance.Sharpness(crop.convert("L")).enhance(3.0),
-            img,                          # imagem completa como fallback
-            img.convert("L"),
-        ]
-
-        for candidate in candidates:
-            codes = pz(candidate)
-            if codes:
-                return codes[0].data.decode("utf-8", errors="ignore")
-
-        return None
-    except Exception:
-        return None
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -239,21 +165,14 @@ with tab_nova:
                 st.rerun()
 
             if st.session_state[f"scan_on_{i}"]:
-                # Label contém "barras" → JS injeta o overlay de guia
-                scan_img = st.camera_input(
-                    "Código de barras — centralize na área verde",
-                    key=f"scanimg_{i}",
-                    label_visibility="visible",
-                )
-                if scan_img:
-                    raw = scan_img.read()
-                    decoded = _decode_barcode(raw)
-                    if decoded:
-                        st.session_state[f"serial_{i}"] = decoded
-                        st.session_state[f"scan_on_{i}"] = False
-                        st.rerun()
-                    else:
-                        st.warning("Código não detectado — ajuste o ângulo e tente novamente.")
+                result = barcode_scanner(key=f"scanner_{i}")
+                if result is not None:
+                    st.session_state[f"scan_on_{i}"] = False
+                    rtype = result.get("type", "")
+                    rval  = (result.get("value") or "").strip()
+                    if rtype in ("barcode", "ocr") and rval:
+                        st.session_state[f"serial_{i}"] = rval
+                    st.rerun()
 
             # ── Foto: câmera ou upload ────────────────────────────────────
             st.caption("Foto do equipamento")

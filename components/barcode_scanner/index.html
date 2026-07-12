@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#000; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; overflow:hidden; }
+
+.wrap { position:relative; width:100%; background:#000; }
+#v    { width:100%; display:block; }
+#overlay {
+  position:absolute; top:0; left:0;
+  width:100%; height:100%;
+  pointer-events:none;
+}
+
+.bar {
+  background:#111;
+  padding:7px 12px;
+  display:flex; align-items:center; gap:8px;
+}
+.bar label { color:#64748b; font-size:11px; white-space:nowrap; }
+.bar input  { flex:1; accent-color:#00e676; }
+
+.status {
+  padding:5px 12px;
+  font-size:12px; text-align:center;
+  color:#00e676; background:rgba(0,0,0,.7);
+  min-height:24px;
+}
+
+.btns { display:flex; gap:0; }
+button {
+  flex:1; padding:11px 6px;
+  font-size:13px; font-weight:600;
+  border:none; cursor:pointer; color:#fff;
+}
+.b-ocr    { background:#1d4ed8; }
+.b-cancel { background:#374151; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <video id="v" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div class="status" id="st">🔍 Procurando código…</div>
+
+<div class="bar">
+  <label>🔍−</label>
+  <input type="range" id="zoom" min="1" max="100" value="20">
+  <label>+</label>
+</div>
+
+<div class="btns">
+  <button class="b-ocr"    id="bOcr">🔤 OCR</button>
+  <button class="b-cancel" id="bCan">✖ Cancelar</button>
+</div>
+
+<canvas id="cap" style="display:none"></canvas>
+
+<script src="https://unpkg.com/jsqr@1.4.0/dist/jsQR.min.js"></script>
+<script>
+// ── Streamlit communication ──────────────────────────────────────────────
+window.parent.postMessage({type:'streamlit:componentReady',apiVersion:1},'*');
+function stSend(val){
+  window.parent.postMessage({type:'streamlit:setComponentValue',apiVersion:1,value:val},'*');
+}
+function stHeight(){
+  window.parent.postMessage({type:'streamlit:setFrameHeight',height:document.documentElement.scrollHeight},'*');
+}
+
+// ── Elementos ────────────────────────────────────────────────────────────
+const video   = document.getElementById('v');
+const overlay = document.getElementById('overlay');
+const capCv   = document.getElementById('cap');
+const stEl    = document.getElementById('st');
+let stream, scanTick, animTick;
+let guideRect = {};   // {x,y,w,h} em pixels do display
+let found = false;
+
+// ── Câmera ───────────────────────────────────────────────────────────────
+navigator.mediaDevices.getUserMedia({
+  video:{ facingMode:{ideal:'environment'}, width:{ideal:1920} }
+}).then(s => {
+  stream = s;
+  video.srcObject = s;
+  video.play().then(()=>{
+    resizeOverlay();
+    startScan();
+    stHeight();
+  });
+}).catch(e=>{
+  stEl.textContent = '❌ ' + e.message;
+  stEl.style.color = '#ef4444';
+  stHeight();
+});
+
+// ── Overlay ───────────────────────────────────────────────────────────────
+let lineY = 0, lineDir = 1;
+
+function resizeOverlay(){
+  const vr = video.getBoundingClientRect();
+  overlay.width  = vr.width;
+  overlay.height = vr.height;
+
+  // Retângulo de leitura: estreito e centrado (tipo scanner real)
+  const gw = Math.round(vr.width  * 0.68);
+  const gh = Math.round(vr.height * 0.28);
+  const gx = Math.round((vr.width  - gw) / 2);
+  const gy = Math.round((vr.height - gh) / 2);
+  guideRect = { x:gx, y:gy, w:gw, h:gh,
+                vw:vr.width, vh:vr.height };
+}
+
+function drawOverlay(){
+  const {x,y,w,h,vw,vh} = guideRect;
+  if(!vw) return;
+  const ctx = overlay.getContext('2d');
+  ctx.clearRect(0,0,overlay.width,overlay.height);
+
+  // Máscara escura
+  ctx.fillStyle='rgba(0,0,0,.55)';
+  ctx.fillRect(0,0,vw,vh);
+  ctx.clearRect(x,y,w,h);
+
+  // Borda fina
+  ctx.strokeStyle='#00e676';
+  ctx.lineWidth=1.5;
+  ctx.strokeRect(x,y,w,h);
+
+  // Cantos
+  const c=14, lw=3;
+  ctx.strokeStyle='#00e676'; ctx.lineWidth=lw;
+  [[x,y,1,1],[x+w,y,-1,1],[x,y+h,1,-1],[x+w,y+h,-1,-1]].forEach(([ox,oy,dx,dy])=>{
+    ctx.beginPath();
+    ctx.moveTo(ox+dx*c,oy); ctx.lineTo(ox,oy); ctx.lineTo(ox,oy+dy*c);
+    ctx.stroke();
+  });
+
+  // Linha de varredura
+  if(!found){
+    const ly = y + lineY;
+    const grad = ctx.createLinearGradient(x,ly-3,x,ly+3);
+    grad.addColorStop(0,'transparent');
+    grad.addColorStop(.5,'rgba(0,230,118,.65)');
+    grad.addColorStop(1,'transparent');
+    ctx.fillStyle=grad;
+    ctx.fillRect(x+2, ly-3, w-4, 6);
+    lineY += lineDir*3;
+    if(lineY >= h){ lineDir=-1; } if(lineY <= 0){ lineDir=1; }
+  }
+
+  // Label
+  ctx.fillStyle='rgba(0,230,118,.9)';
+  ctx.font='11px -apple-system,sans-serif';
+  ctx.textAlign='center';
+  ctx.fillText('Centralize o código aqui', vw/2, y+h+14);
+}
+
+// ── Scan automático ───────────────────────────────────────────────────────
+function cropGuide(){
+  const {x,y,w,h,vw,vh} = guideRect;
+  const sx = video.videoWidth  / vw;
+  const sy = video.videoHeight / vh;
+  capCv.width  = Math.round(w * sx);
+  capCv.height = Math.round(h * sy);
+  capCv.getContext('2d').drawImage(
+    video,
+    Math.round(x*sx), Math.round(y*sy), capCv.width, capCv.height,
+    0, 0, capCv.width, capCv.height
+  );
+  return capCv;
+}
+
+function startScan(){
+  animTick = setInterval(drawOverlay, 30);
+
+  scanTick = setInterval(()=>{
+    if(found || !video.videoWidth || !guideRect.vw) return;
+    const cv = cropGuide();
+    const ctx = cv.getContext('2d');
+    const imgD = ctx.getImageData(0,0,cv.width,cv.height);
+
+    // BarcodeDetector (Chrome nativo)
+    if('BarcodeDetector' in window){
+      const bd = new BarcodeDetector({formats:[
+        'qr_code','code_128','code_39','ean_13','ean_8',
+        'upc_a','upc_e','data_matrix','pdf417','aztec','itf','codabar'
+      ]});
+      bd.detect(cv).then(codes=>{
+        if(codes.length && !found) gotCode(codes[0].rawValue,'barcode');
+      }).catch(()=>{});
+    }
+
+    // jsQR fallback
+    const qr = jsQR(imgD.data, imgD.width, imgD.height, {inversionAttempts:'dontInvert'});
+    if(qr && !found) gotCode(qr.data,'barcode');
+
+    // jsQR invertido (alguns QR são negativos)
+    const qrI = jsQR(imgD.data, imgD.width, imgD.height, {inversionAttempts:'onlyInvert'});
+    if(qrI && !found) gotCode(qrI.data,'barcode');
+
+  }, 200);
+}
+
+function gotCode(text, type){
+  found=true;
+  clearInterval(scanTick); clearInterval(animTick);
+  stEl.textContent = '✅ ' + text.substring(0,50) + (text.length>50?'…':'');
+  stopCamera();
+  stSend({type, value:text.trim()});
+}
+
+// ── OCR ───────────────────────────────────────────────────────────────────
+document.getElementById('bOcr').addEventListener('click', async ()=>{
+  if(!video.videoWidth) return;
+  clearInterval(scanTick);
+  stEl.textContent = '🔤 Carregando OCR…';
+  const cv = cropGuide();
+  const dataUrl = cv.toDataURL('image/jpeg',.95);
+
+  if(!window.Tesseract){
+    await new Promise(res=>{
+      const s=document.createElement('script');
+      s.src='https://unpkg.com/tesseract.js@5/dist/tesseract.min.js';
+      s.onload=res; document.head.appendChild(s);
+    });
+  }
+  stEl.textContent = '🔤 Executando OCR…';
+  try{
+    const w = await Tesseract.createWorker('eng');
+    const {data:{text}} = await w.recognize(dataUrl);
+    await w.terminate();
+    const clean = text.replace(/\s+/g,' ').trim();
+    if(clean){
+      stopCamera();
+      stSend({type:'ocr', value:clean});
+    } else {
+      stEl.textContent = '⚠️ Nenhum texto detectado.';
+      stEl.style.color='#f59e0b';
+      clearInterval(scanTick);
+      scanTick = setInterval(()=>{
+        if(!found && video.videoWidth && guideRect.vw){
+          const cv2=cropGuide();
+          const d=cv2.getContext('2d').getImageData(0,0,cv2.width,cv2.height);
+          const q=jsQR(d.data,d.width,d.height,{inversionAttempts:'dontInvert'});
+          if(q) gotCode(q.data,'barcode');
+        }
+      },200);
+    }
+  } catch(e){
+    stEl.textContent='❌ OCR: '+e.message;
+    stEl.style.color='#ef4444';
+  }
+});
+
+// ── Cancelar ─────────────────────────────────────────────────────────────
+document.getElementById('bCan').addEventListener('click',()=>{
+  stopCamera();
+  stSend({type:'cancel'});
+});
+
+function stopCamera(){
+  clearInterval(scanTick); clearInterval(animTick);
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+}
+
+// ── Zoom ─────────────────────────────────────────────────────────────────
+document.getElementById('zoom').addEventListener('input', async function(){
+  if(!stream) return;
+  const track = stream.getVideoTracks()[0];
+  const cap = track.getCapabilities ? track.getCapabilities() : {};
+  if(cap.zoom){
+    const {min,max}=cap.zoom;
+    await track.applyConstraints({advanced:[{zoom: min+(max-min)*(this.value/100)}]}).catch(()=>{});
+  }
+});
+
+window.addEventListener('resize',()=>{ resizeOverlay(); stHeight(); });
+setTimeout(stHeight, 500);
+</script>
+</body>
+</html>
