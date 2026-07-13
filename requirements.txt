@@ -5,3 +5,4 @@ streamlit-drawable-canvas
 streamlit-js-eval
 Pillow
 pyzbar
+fpdf2

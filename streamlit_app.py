@@ -1,5 +1,6 @@
 """Controle Logístico — verificação de equipamentos e histórico"""
 import base64, hashlib, io, json, os
+from datetime import datetime as _dt
 import streamlit as st
 import pandas as pd
 import psycopg2
@@ -357,6 +358,133 @@ def _historico(supervisor=None, tr=None):
 def _img_to_b64(raw: bytes, mime="image/jpeg"):
     return f"data:{mime};base64," + base64.b64encode(raw).decode()
 
+def _gerar_pdf(tech, conferente, itens, assin_tec, assin_conf):
+    """Gera PDF da conferência e retorna bytes, ou None se fpdf2 não instalado."""
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        return None
+
+    def _b64raw(data_url):
+        if not data_url: return None
+        try:
+            _, b64 = data_url.split(",", 1)
+            return base64.b64decode(b64)
+        except Exception: return None
+
+    def _img_buf(raw, max_px=700):
+        if not raw: return None, 1, 1
+        try:
+            img = PILImage.open(io.BytesIO(raw))
+            img.thumbnail((max_px, max_px), PILImage.LANCZOS)
+            if img.mode in ("RGBA", "P"): img = img.convert("RGB")
+            buf = io.BytesIO(); img.save(buf, format="JPEG", quality=88); buf.seek(0)
+            return buf, img.size[0], img.size[1]
+        except Exception: return None, 1, 1
+
+    now = _dt.now().strftime("%d/%m/%Y %H:%M")
+    pdf = FPDF(); pdf.set_auto_page_break(auto=True, margin=15); pdf.add_page()
+    M, W = 15, 180  # margem, largura útil A4
+
+    # ── Cabeçalho ──────────────────────────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.cell(W, 11, "ONT DE REVERSA", align="C", ln=1)
+    pdf.set_font("Helvetica", "", 8)
+    linha_topo = f"Emitido em {now}   |   Tecnico: {tech.get('nome','')}   |   TR: {tech.get('tr','')}"
+    pdf.cell(W, 4, linha_topo, align="C", ln=1)
+    pdf.set_draw_color(80, 80, 80); pdf.set_line_width(0.4)
+    pdf.line(M, pdf.get_y() + 2, M + W, pdf.get_y() + 2); pdf.ln(6)
+
+    # ── Dados do técnico (2 colunas) ───────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 9); pdf.set_fill_color(225, 225, 225)
+    pdf.cell(W, 5, "DADOS DO TECNICO", fill=True, ln=1)
+    campos = [("Nome", tech.get("nome","")), ("TR", tech.get("tr","")),
+              ("Supervisor", tech.get("supervisor","")), ("Operadora", tech.get("operadora","") or ""),
+              ("Setor", tech.get("setor","") or ""), ("Conferente", conferente)]
+    for i in range(0, len(campos), 2):
+        y = pdf.get_y()
+        for j in range(2):
+            if i + j >= len(campos): break
+            lbl, val = campos[i + j]
+            pdf.set_xy(M + j * (W / 2), y)
+            pdf.set_font("Helvetica", "B", 9); pdf.cell(28, 5, lbl + ":")
+            pdf.set_font("Helvetica", "", 9); pdf.cell(W / 2 - 28, 5, str(val or ""))
+        pdf.set_y(y + 5)
+    pdf.ln(4)
+
+    # ── Tabela de equipamentos ─────────────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 9); pdf.set_fill_color(225, 225, 225)
+    pdf.cell(W, 5, "EQUIPAMENTOS", fill=True, ln=1); pdf.ln(1)
+    cw = [9, 68, 22, 55, W - 154]  # #, Serial, Status, Local, Hora
+    ch = ["#", "Serial", "Status", "Localizacao", "Hora Foto"]
+    pdf.set_font("Helvetica", "B", 8); pdf.set_fill_color(235, 235, 235)
+    for w, h in zip(cw, ch):
+        pdf.cell(w, 5, h, border=1, fill=True, align="C")
+    pdf.ln()
+    pdf.set_font("Helvetica", "", 8)
+    for it in itens:
+        ok_ = it.get("verificado")
+        pdf.set_fill_color(228, 255, 228) if ok_ else pdf.set_fill_color(255, 255, 255)
+        g = it.get("geo") or {}
+        loc = f"{g['lat']}, {g['lon']}" if g.get("lat") else ""
+        vals = [str(it.get("id","")), str(it.get("serial") or "")[:36],
+                "OK" if ok_ else "Pendente", loc, (it.get("foto_ts") or "")[:16]]
+        for w, v in zip(cw, vals):
+            pdf.cell(w, 5, v, border=1, fill=True)
+        pdf.ln()
+    pdf.ln(4)
+
+    # ── Fotos (2 por linha) ────────────────────────────────────────────────
+    foto_itens = [it for it in itens if it.get("foto_b64")]
+    if foto_itens:
+        pdf.set_font("Helvetica", "B", 9); pdf.set_fill_color(225, 225, 225)
+        pdf.cell(W, 5, "FOTOS DOS EQUIPAMENTOS", fill=True, ln=1); pdf.ln(2)
+        IW = (W - 5) / 2
+        col, row_y, row_h = 0, pdf.get_y(), 0
+        for it in foto_itens:
+            buf, iw, ih = _img_buf(_b64raw(it["foto_b64"]))
+            if not buf: continue
+            img_h = IW * ih / iw if iw else IW * 0.75
+            block_h = img_h + 7
+            if pdf.get_y() + block_h > pdf.h - 18:
+                if col > 0: pdf.set_y(row_y + row_h + 2)
+                pdf.add_page(); row_y = pdf.get_y(); col = 0; row_h = 0
+            if col == 0: row_y = pdf.get_y()
+            x = M + col * (IW + 5)
+            pdf.image(buf, x=x, y=row_y, w=IW)
+            pdf.set_xy(x, row_y + img_h + 1)
+            pdf.set_font("Helvetica", "", 6)
+            g = it.get("geo") or {}
+            cap = f"Item {it.get('id')} | {(it.get('foto_ts') or '')[:16]}"
+            if g.get("lat"): cap += f" | {g['lat']}, {g['lon']}"
+            pdf.cell(IW, 4, cap)
+            row_h = max(row_h, block_h); col += 1
+            if col >= 2:
+                pdf.set_y(row_y + row_h + 2); col = 0; row_h = 0
+        if col > 0: pdf.set_y(row_y + row_h + 2)
+        pdf.ln(2)
+
+    # ── Assinaturas ────────────────────────────────────────────────────────
+    if assin_tec or assin_conf:
+        if pdf.get_y() + 50 > pdf.h - 15: pdf.add_page()
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 9); pdf.set_fill_color(225, 225, 225)
+        pdf.cell(W, 5, "ASSINATURAS", fill=True, ln=1); pdf.ln(3)
+        SY = pdf.get_y(); SW = (W - 10) / 2; SH = SW * 0.45
+        for idx, (lbl, sig_url) in enumerate([("Tecnico", assin_tec), ("Conferente", assin_conf)]):
+            x = M + idx * (SW + 10)
+            buf, _, _ = _img_buf(_b64raw(sig_url) if sig_url else None, max_px=400)
+            if buf:
+                try: pdf.image(buf, x=x, y=SY, w=SW)
+                except Exception: pass
+            pdf.set_draw_color(0, 0, 0)
+            pdf.line(x, SY + SH, x + SW, SY + SH)
+            pdf.set_xy(x, SY + SH + 2)
+            pdf.set_font("Helvetica", "", 8)
+            pdf.cell(SW, 4, lbl, align="C")
+
+    return bytes(pdf.output())
+
 # ── Abas ────────────────────────────────────────────────────────────────────
 
 tab_nova, tab_hist = st.tabs(["📋 Nova Conferência", "📊 Histórico"])
@@ -530,7 +658,8 @@ with tab_nova:
              conferente.strip(), json.dumps(itens_state), assin_tec, assin_conf),
         )
         if ok:
-            st.success("✅ Conferência salva!")
+            # Gera PDF antes de limpar o estado
+            pdf_bytes = _gerar_pdf(tech, conferente.strip(), itens_state, assin_tec, assin_conf)
             for i in range(1, 21):
                 for k in (f"si_{i}", f"foto_b64_{i}", f"foto_geo_{i}", f"foto_ts_{i}", f"scan_pending_{i}"):
                     st.session_state.pop(k, None)
@@ -539,6 +668,19 @@ with tab_nova:
                 st.session_state[f"foto_on_{i}"] = False
                 st.session_state[f"foto_cnt_{i}"] = 0
             st.cache_data.clear()
+            st.success("✅ Conferência salva!")
+            if pdf_bytes:
+                fname = f"ONT_REVERSA_{tech['tr']}_{_dt.now().strftime('%Y%m%d_%H%M')}.pdf"
+                st.download_button(
+                    "📄 Baixar PDF",
+                    data=pdf_bytes,
+                    file_name=fname,
+                    mime="application/pdf",
+                    type="primary",
+                    use_container_width=True,
+                )
+            else:
+                st.warning("PDF não disponível (fpdf2 não instalado).")
 
 
 # ════════════════════════════════════════════════════════════════════════════
