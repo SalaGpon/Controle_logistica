@@ -4,191 +4,10 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from PIL import Image as PILImage
+from pyzbar.pyzbar import decode as _pyzbar_decode
 
 st.set_page_config(page_title="Controle Logístico", page_icon="📦", layout="wide")
-
-# ── JS eval (scanner + geo) ─────────────────────────────────────────────────
-try:
-    from streamlit_js_eval import streamlit_js_eval as _js_eval
-    _HAS_JS = True
-except ImportError:
-    _HAS_JS = False
-    def _js_eval(*a, **kw): return None
-
-# ── Scanner JS ───────────────────────────────────────────────────────────────
-# Fluxo: câmera ao vivo + BarcodeDetector passivo (auto) + botão "Foto+OCR"
-# que congela o frame e roda Tesseract na imagem parada (mais confiável).
-# Tudo carregado no iframe (sem CSP da página pai do Streamlit Cloud).
-_SCANNER_JS = """
-new Promise(function(RESOLVE){
-  var PD=window.parent.document;
-  var old=PD.getElementById('_bscan'); if(old)old.remove();
-  var ROOT=PD.createElement('div');
-  ROOT.id='_bscan';
-  ROOT.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;background:#000;z-index:2147483647;display:flex;flex-direction:column;font-family:-apple-system,sans-serif;';
-  var VWRAP=PD.createElement('div');
-  VWRAP.style.cssText='position:relative;flex:1;min-height:0;overflow:hidden;';
-  var VID=PD.createElement('video');
-  VID.autoplay=true; VID.playsInline=true; VID.muted=true;
-  VID.style.cssText='width:100%;height:100%;object-fit:cover;display:block;';
-  var OV=PD.createElement('canvas');
-  OV.style.cssText='position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;';
-  VWRAP.appendChild(VID); VWRAP.appendChild(OV);
-  var ST=PD.createElement('div');
-  ST.style.cssText='padding:6px 12px;text-align:center;font-size:12px;color:#94a3b8;background:rgba(0,0,0,.85);';
-  ST.textContent='Aponte a camera. Codigo de barras detecta automatico.';
-  var ZBAR=PD.createElement('div');
-  ZBAR.style.cssText='background:#111;padding:6px 12px;display:flex;align-items:center;gap:8px;';
-  ZBAR.innerHTML='<span style="color:#64748b;font-size:11px;">Zoom:</span><input id="_bzmr" type="range" min="1" max="100" value="20" style="flex:1;accent-color:#00e676;"><span style="color:#64748b;font-size:11px;">+</span>';
-  var BTNS=PD.createElement('div');
-  BTNS.style.display='flex';
-  var BCAP=PD.createElement('button');
-  BCAP.textContent='Tirar Foto + Ler Texto (OCR)';
-  BCAP.style.cssText='flex:2;padding:13px;background:#1d4ed8;color:#fff;border:none;font-size:14px;font-weight:700;cursor:pointer;';
-  var BCAN=PD.createElement('button');
-  BCAN.textContent='Cancelar';
-  BCAN.style.cssText='flex:1;padding:13px;background:#374151;color:#fff;border:none;font-size:14px;font-weight:600;cursor:pointer;';
-  BTNS.appendChild(BCAP); BTNS.appendChild(BCAN);
-  ROOT.appendChild(VWRAP); ROOT.appendChild(ST); ROOT.appendChild(ZBAR); ROOT.appendChild(BTNS);
-  PD.body.appendChild(ROOT);
-
-  // CAP e bibliotecas carregam no IFRAME (sem CSP da pagina pai)
-  var CAP=document.createElement('canvas');
-  var stream,scanT,animT,GR={},found=false,LY=0,LD=1,qrFn=null,BDinst=null;
-
-  function DONE(v){
-    found=true; clearInterval(scanT); clearInterval(animT);
-    if(stream) stream.getTracks().forEach(function(t){t.stop();});
-    ROOT.remove();
-    window.postMessage({_bscanRes:v},'*');
-  }
-  window.addEventListener('message',function H(e){
-    if(e.data&&e.data._bscanRes!==undefined){window.removeEventListener('message',H); RESOLVE(e.data._bscanRes);}
-  });
-
-  navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1920}}})
-  .then(function(s){stream=s; VID.srcObject=s; return VID.play();})
-  .then(function(){
-    setTimeout(RZ,200); animT=setInterval(DRAW,30);
-    // BarcodeDetector nativo — auto-deteccao sem CDN
-    var BDC=window.BarcodeDetector||window.parent.BarcodeDetector;
-    if(BDC){ try{BDinst=new BDC();}catch(e){} }
-    // jsQR em background como fallback para QR codes
-    var s=document.createElement('script');
-    s.src='https://unpkg.com/jsqr@1.4.0/dist/jsQR.min.js';
-    s.onload=function(){qrFn=window.jsQR||null;};
-    document.head.appendChild(s);
-    // Scan passivo (auto-detecta silenciosamente, sem spinner)
-    scanT=setInterval(function(){
-      if(found||!VID.videoWidth||!GR.vw) return;
-      var cv=CROP();
-      if(qrFn){
-        var d=cv.getContext('2d').getImageData(0,0,cv.width,cv.height);
-        var q=qrFn(d.data,d.width,d.height,{inversionAttempts:'dontInvert'});
-        if(q&&!found){DONE({type:'barcode',value:q.data}); return;}
-      }
-      if(BDinst){
-        BDinst.detect(cv).then(function(cs){
-          if(cs.length&&!found)DONE({type:'barcode',value:cs[0].rawValue});
-        }).catch(function(){});
-      }
-    },300);
-  }).catch(function(e){ST.textContent='Erro camera: '+e.message; ST.style.color='#ef4444';});
-
-  function RZ(){
-    var r=VID.getBoundingClientRect(); if(!r.width)return;
-    OV.width=r.width; OV.height=r.height;
-    var gw=Math.round(r.width*.68),gh=Math.round(r.height*.28);
-    GR={x:Math.round((r.width-gw)/2),y:Math.round((r.height-gh)/2),w:gw,h:gh,vw:r.width,vh:r.height};
-  }
-  function DRAW(){
-    if(!GR.vw)return;
-    var c=OV.getContext('2d');
-    c.clearRect(0,0,OV.width,OV.height);
-    c.fillStyle='rgba(0,0,0,.55)'; c.fillRect(0,0,GR.vw,GR.vh);
-    c.clearRect(GR.x,GR.y,GR.w,GR.h);
-    c.strokeStyle='#00e676'; c.lineWidth=1.5; c.strokeRect(GR.x,GR.y,GR.w,GR.h);
-    var cs=14; c.lineWidth=3;
-    [[GR.x,GR.y,1,1],[GR.x+GR.w,GR.y,-1,1],[GR.x,GR.y+GR.h,1,-1],[GR.x+GR.w,GR.y+GR.h,-1,-1]].forEach(function(p){
-      c.beginPath(); c.moveTo(p[0]+p[2]*cs,p[1]); c.lineTo(p[0],p[1]); c.lineTo(p[0],p[1]+p[3]*cs); c.stroke();
-    });
-    if(!found){
-      var ly=GR.y+LY,g2=c.createLinearGradient(0,ly-3,0,ly+3);
-      g2.addColorStop(0,'transparent'); g2.addColorStop(.5,'rgba(0,230,118,.65)'); g2.addColorStop(1,'transparent');
-      c.fillStyle=g2; c.fillRect(GR.x+2,ly-3,GR.w-4,6);
-      LY+=LD*3; if(LY>=GR.h)LD=-1; if(LY<=0)LD=1;
-    }
-    c.fillStyle='rgba(0,230,118,.9)'; c.font='11px sans-serif'; c.textAlign='center';
-    c.fillText('Centralize o codigo aqui',GR.vw/2,GR.y+GR.h+14);
-  }
-  function CROP(){
-    var sx=VID.videoWidth/GR.vw,sy=VID.videoHeight/GR.vh;
-    CAP.width=Math.round(GR.w*sx); CAP.height=Math.round(GR.h*sy);
-    CAP.getContext('2d').drawImage(VID,Math.round(GR.x*sx),Math.round(GR.y*sy),CAP.width,CAP.height,0,0,CAP.width,CAP.height);
-    return CAP;
-  }
-  function CROP_FULL(){
-    var cv=document.createElement('canvas');
-    cv.width=VID.videoWidth||640; cv.height=VID.videoHeight||480;
-    cv.getContext('2d').drawImage(VID,0,0);
-    return cv;
-  }
-
-  // Botao principal: congela frame e roda OCR na imagem estatica
-  BCAP.addEventListener('click',async function(){
-    if(found||BCAP.disabled) return;
-    BCAP.disabled=true; BCAP.textContent='Aguarde...';
-    clearInterval(scanT); clearInterval(animT);
-    // Captura frame completo e pausa video (exibe ultimo frame congelado)
-    var dataUrl=CROP_FULL().toDataURL('image/jpeg',.92);
-    VID.pause();
-    ST.textContent='Carregando OCR...'; ST.style.color='#00e676';
-    // Carrega Tesseract no IFRAME (sem restricao CSP do pai)
-    var Tes=window.Tesseract;
-    if(!Tes){
-      try{
-        await new Promise(function(res,rej){
-          var s=document.createElement('script');
-          s.src='https://unpkg.com/tesseract.js@5/dist/tesseract.min.js';
-          s.onload=res; s.onerror=function(){rej(new Error('CDN bloqueado'));};
-          document.head.appendChild(s);
-        });
-        Tes=window.Tesseract;
-      }catch(le){ ST.textContent='Erro: '+le.message; ST.style.color='#ef4444'; resetCam(); return; }
-    }
-    if(!Tes){ ST.textContent='OCR indisponivel'; ST.style.color='#ef4444'; resetCam(); return; }
-    ST.textContent='Lendo texto na imagem...';
-    try{
-      var w=await Tes.createWorker('eng');
-      var r=await w.recognize(dataUrl); await w.terminate();
-      var txt=r.data.text.replace(/\\s+/g,' ').trim();
-      if(txt){ DONE({type:'ocr',value:txt}); }
-      else{ ST.textContent='Nenhum texto. Tente novamente.'; ST.style.color='#f59e0b'; resetCam(); }
-    }catch(e){ ST.textContent='OCR erro: '+e.message; ST.style.color='#ef4444'; resetCam(); }
-  });
-
-  function resetCam(){
-    VID.play(); BCAP.disabled=false; BCAP.textContent='Tirar Foto + Ler Texto (OCR)';
-    ST.textContent='Aponte a camera. Codigo de barras detecta automatico.'; ST.style.color='#94a3b8';
-    animT=setInterval(DRAW,30);
-    scanT=setInterval(function(){
-      if(found||!VID.videoWidth||!GR.vw) return;
-      var cv=CROP();
-      if(qrFn){var d=cv.getContext('2d').getImageData(0,0,cv.width,cv.height); var q=qrFn(d.data,d.width,d.height,{inversionAttempts:'dontInvert'}); if(q&&!found){DONE({type:'barcode',value:q.data}); return;}}
-      if(BDinst){BDinst.detect(cv).then(function(cs){if(cs.length&&!found)DONE({type:'barcode',value:cs[0].rawValue});}).catch(function(){});}
-    },300);
-  }
-
-  PD.getElementById('_bzmr').addEventListener('input',async function(){
-    if(!stream)return;
-    var track=stream.getVideoTracks()[0];
-    var cap=track.getCapabilities?track.getCapabilities():{};
-    if(cap.zoom){var z=cap.zoom; await track.applyConstraints({advanced:[{zoom:z.min+(z.max-z.min)*(this.value/100)}]}).catch(function(){});}
-  });
-  BCAN.addEventListener('click',function(){DONE({type:'cancel'});});
-  window.addEventListener('resize',RZ);
-})
-"""
 
 # ── Conexão ─────────────────────────────────────────────────────────────────
 
@@ -256,20 +75,16 @@ def _historico(supervisor=None, tr=None):
 def _img_to_b64(raw: bytes, mime="image/jpeg"):
     return f"data:{mime};base64," + base64.b64encode(raw).decode()
 
-def _get_geo(suffix: str):
-    if not _HAS_JS:
-        return None
-    return _js_eval(
-        js_expressions=(
-            "new Promise(r => navigator.geolocation.getCurrentPosition("
-            "p => r({lat:p.coords.latitude.toFixed(6),"
-            "        lon:p.coords.longitude.toFixed(6),"
-            "        acc:Math.round(p.coords.accuracy),"
-            "        ts:new Date().toLocaleString('pt-BR')}),"
-            "() => r(null),{timeout:8000,enableHighAccuracy:true}))"
-        ),
-        key=f"geo_{suffix}",
-    )
+def _decode_barcode(raw: bytes):
+    """Tenta decodificar código de barras/QR com pyzbar. Retorna string ou None."""
+    try:
+        img = PILImage.open(io.BytesIO(raw))
+        codes = _pyzbar_decode(img)
+        if codes:
+            return codes[0].data.decode("utf-8").strip()
+    except Exception:
+        pass
+    return None
 
 # ── Abas ────────────────────────────────────────────────────────────────────
 
@@ -306,10 +121,8 @@ with tab_nova:
     for i in range(1, 11):
         st.session_state.setdefault(f"serial_{i}", "")
         st.session_state.setdefault(f"scan_on_{i}", False)
-        st.session_state.setdefault(f"scan_cnt_{i}", 0)
         st.session_state.setdefault(f"foto_b64_{i}", None)
         st.session_state.setdefault(f"foto_hash_{i}", "")
-        st.session_state.setdefault(f"geo_{i}", None)
 
     st.subheader("Itens")
     itens_state = []
@@ -329,70 +142,41 @@ with tab_nova:
 
             btn_lbl = "✖ Fechar" if st.session_state[f"scan_on_{i}"] else "📷 Scan"
             if col_btn.button(btn_lbl, key=f"scanbtn_{i}"):
-                if not st.session_state[f"scan_on_{i}"]:
-                    st.session_state[f"scan_cnt_{i}"] += 1
                 st.session_state[f"scan_on_{i}"] = not st.session_state[f"scan_on_{i}"]
                 st.rerun()
 
-            if st.session_state[f"scan_on_{i}"] and _HAS_JS:
-                scan_key = f"scan_{i}_{st.session_state[f'scan_cnt_{i}']}"
-                result = _js_eval(js_expressions=_SCANNER_JS, key=scan_key)
-                if result is not None:
-                    st.session_state[f"scan_on_{i}"] = False
-                    rtype = (result.get("type") or "") if isinstance(result, dict) else ""
-                    rval  = (result.get("value") or "").strip() if isinstance(result, dict) else ""
-                    if rtype in ("barcode", "ocr") and rval:
-                        st.session_state[f"serial_{i}"] = rval
-                    st.rerun()
+            if st.session_state[f"scan_on_{i}"]:
+                scan_img = st.camera_input(
+                    "Aponte para o código de barras e tire a foto",
+                    key=f"scancam_{i}",
+                )
+                if scan_img:
+                    raw = scan_img.read()
+                    code = _decode_barcode(raw)
+                    if code:
+                        st.session_state[f"serial_{i}"] = code
+                        st.session_state[f"scan_on_{i}"] = False
+                        st.rerun()
+                    else:
+                        st.warning("Código não encontrado. Ajuste o ângulo/zoom e tente novamente.")
 
-            # ── Foto: câmera ou upload ────────────────────────────────────
-            st.caption("Foto do equipamento")
-            foto_src = st.radio(
-                "Fonte",
-                ["📷 Câmera", "⬆️ Upload", "— Nenhuma"],
-                key=f"fotosrc_{i}",
-                horizontal=True,
+            # ── Foto: somente upload ───────────────────────────────────────
+            st.caption("Foto do equipamento (opcional)")
+            upload = st.file_uploader(
+                "Selecionar foto",
+                type=["jpg", "jpeg", "png"],
+                key=f"fotoup_{i}",
                 label_visibility="collapsed",
             )
-
-            if "Câmera" in foto_src:
-                foto_cam = st.camera_input(
-                    "Foto do equipamento",
-                    key=f"fotocam_{i}",
-                    label_visibility="collapsed",
-                )
-                if foto_cam:
-                    raw_foto = foto_cam.read()
-                    fh = hashlib.md5(raw_foto).hexdigest()[:10]
-                    if fh != st.session_state[f"foto_hash_{i}"]:
-                        st.session_state[f"foto_b64_{i}"] = _img_to_b64(raw_foto)
-                        st.session_state[f"foto_hash_{i}"] = fh
-                        st.session_state[f"geo_{i}"] = None
-                    if st.session_state[f"foto_hash_{i}"]:
-                        geo = _get_geo(f"{i}_{st.session_state[f'foto_hash_{i}']}")
-                        if geo and "lat" in geo:
-                            st.session_state[f"geo_{i}"] = geo
-
-            elif "Upload" in foto_src:
-                upload = st.file_uploader(
-                    "Escolher imagem", type=["jpg", "jpeg", "png"],
-                    key=f"fotoup_{i}", label_visibility="collapsed",
-                )
-                if upload:
-                    st.session_state[f"foto_b64_{i}"] = _img_to_b64(upload.read())
-                    st.session_state[f"geo_{i}"] = None
-            else:
-                st.session_state[f"foto_b64_{i}"] = None
-                st.session_state[f"geo_{i}"] = None
+            if upload:
+                raw_foto = upload.read()
+                fh = hashlib.md5(raw_foto).hexdigest()[:10]
+                if fh != st.session_state[f"foto_hash_{i}"]:
+                    st.session_state[f"foto_b64_{i}"] = _img_to_b64(raw_foto)
+                    st.session_state[f"foto_hash_{i}"] = fh
 
             if st.session_state[f"foto_b64_{i}"]:
                 st.image(st.session_state[f"foto_b64_{i}"], width=180)
-                g = st.session_state[f"geo_{i}"]
-                if g and "lat" in g:
-                    maps = f"https://www.google.com/maps?q={g['lat']},{g['lon']}"
-                    st.caption(f"📍 {g['lat']}, {g['lon']} · {g['ts']} · [ver mapa]({maps})")
-                elif "Câmera" in foto_src:
-                    st.caption("⏳ Obtendo localização…")
 
             verificado = st.checkbox("✅ Item verificado", key=f"veri_{i}")
             itens_state.append({
@@ -400,7 +184,6 @@ with tab_nova:
                 "serial": st.session_state[f"serial_{i}"],
                 "verificado": verificado,
                 "foto_b64": st.session_state[f"foto_b64_{i}"],
-                "geo": st.session_state[f"geo_{i}"],
             })
 
     # ── Assinaturas ─────────────────────────────────────────────────────────
@@ -409,7 +192,6 @@ with tab_nova:
     assin_tec = assin_conf = None
     try:
         from streamlit_drawable_canvas import st_canvas
-        from PIL import Image as PILImage
         col_a, col_b = st.columns(2)
         with col_a:
             st.caption("Técnico")
@@ -446,10 +228,9 @@ with tab_nova:
         if ok:
             st.success("✅ Conferência salva!")
             for i in range(1, 11):
-                for k in (f"serial_{i}", f"foto_b64_{i}", f"geo_{i}", f"foto_hash_{i}"):
+                for k in (f"serial_{i}", f"foto_b64_{i}", f"foto_hash_{i}"):
                     st.session_state.pop(k, None)
                 st.session_state[f"scan_on_{i}"] = False
-                st.session_state[f"scan_cnt_{i}"] = 0
             st.cache_data.clear()
 
 
@@ -508,13 +289,10 @@ with tab_hist:
                 itens = itens_raw if isinstance(itens_raw, list) else json.loads(itens_raw)
                 rows_it = []
                 for it in itens:
-                    g = it.get("geo") or {}
                     rows_it.append({
                         "#": it.get("id"),
                         "Serial": it.get("serial") or "—",
                         "Verificado": "✅" if it.get("verificado") else "❌",
-                        "Localização": f"{g['lat']}, {g['lon']}" if g.get("lat") else "—",
-                        "Data/Hora foto": g.get("ts", "—"),
                     })
                 df_it = pd.DataFrame(rows_it)
                 ok_n = (df_it["Verificado"] == "✅").sum()
