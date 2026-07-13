@@ -284,7 +284,7 @@ tab_nova, tab_hist = st.tabs(["📋 Nova Conferência", "📊 Histórico"])
 # ABA 1 — NOVA CONFERÊNCIA
 # ════════════════════════════════════════════════════════════════════════════
 with tab_nova:
-    st.title("📋 Nova Conferência")
+    st.title("ONT DE REVERSA — ITEM ATÉ 20")
 
     sups = _supervisores()
     sup_sel = st.selectbox("Supervisor", [""] + sups, key="nova_sup")
@@ -305,10 +305,10 @@ with tab_nova:
 
     st.divider()
     conferente = st.text_input("Nome do conferente *", key="nova_conf")
-    n_itens = st.number_input("Quantidade de itens", min_value=1, max_value=10, value=1, step=1)
+    n_itens = st.number_input("Quantidade de itens", min_value=1, max_value=20, value=1, step=1)
 
     # ── Inicializa estado dos itens ─────────────────────────────────────────
-    for i in range(1, 11):
+    for i in range(1, 21):
         st.session_state.setdefault(f"serial_{i}", "")
         st.session_state.setdefault(f"scan_on_{i}", False)
         st.session_state.setdefault(f"scan_cnt_{i}", 0)
@@ -347,6 +347,7 @@ with tab_nova:
                     rval  = (result.get("value") or "").strip() if isinstance(result, dict) else ""
                     if rtype in ("barcode", "ocr") and rval:
                         st.session_state[f"serial_{i}"] = rval
+                        st.session_state[f"si_{i}"] = rval  # atualiza o widget
                     st.rerun()
 
             # ── Foto: somente upload ───────────────────────────────────────
@@ -416,8 +417,8 @@ with tab_nova:
         )
         if ok:
             st.success("✅ Conferência salva!")
-            for i in range(1, 11):
-                for k in (f"serial_{i}", f"foto_b64_{i}", f"foto_hash_{i}"):
+            for i in range(1, 21):
+                for k in (f"serial_{i}", f"foto_b64_{i}", f"foto_hash_{i}", f"si_{i}"):
                     st.session_state.pop(k, None)
                 st.session_state[f"scan_on_{i}"] = False
                 st.session_state[f"scan_cnt_{i}"] = 0
