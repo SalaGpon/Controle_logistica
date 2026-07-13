@@ -16,9 +16,9 @@ except ImportError:
     def _js_eval(*a, **kw): return None
 
 # ── Scanner JS ───────────────────────────────────────────────────────────────
-# Injeta overlay full-screen na página pai, acessa câmera via navigator do
-# iframe (que tem allow="camera"), e devolve resultado via window.postMessage
-# resolvendo o Promise de streamlit_js_eval.
+# Fluxo: câmera ao vivo + BarcodeDetector passivo (auto) + botão "Foto+OCR"
+# que congela o frame e roda Tesseract na imagem parada (mais confiável).
+# Tudo carregado no iframe (sem CSP da página pai do Streamlit Cloud).
 _SCANNER_JS = """
 new Promise(function(RESOLVE){
   var PD=window.parent.document;
@@ -35,26 +35,26 @@ new Promise(function(RESOLVE){
   OV.style.cssText='position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;';
   VWRAP.appendChild(VID); VWRAP.appendChild(OV);
   var ST=PD.createElement('div');
-  ST.style.cssText='padding:5px 12px;text-align:center;font-size:12px;color:#00e676;background:rgba(0,0,0,.8);';
-  ST.textContent='Procurando codigo...';
+  ST.style.cssText='padding:6px 12px;text-align:center;font-size:12px;color:#94a3b8;background:rgba(0,0,0,.85);';
+  ST.textContent='Aponte a camera. Codigo de barras detecta automatico.';
   var ZBAR=PD.createElement('div');
   ZBAR.style.cssText='background:#111;padding:6px 12px;display:flex;align-items:center;gap:8px;';
   ZBAR.innerHTML='<span style="color:#64748b;font-size:11px;">Zoom:</span><input id="_bzmr" type="range" min="1" max="100" value="20" style="flex:1;accent-color:#00e676;"><span style="color:#64748b;font-size:11px;">+</span>';
   var BTNS=PD.createElement('div');
   BTNS.style.display='flex';
-  var BOCR=PD.createElement('button');
-  BOCR.textContent='OCR';
-  BOCR.style.cssText='flex:1;padding:11px;background:#1d4ed8;color:#fff;border:none;font-size:14px;font-weight:700;cursor:pointer;letter-spacing:.5px;';
+  var BCAP=PD.createElement('button');
+  BCAP.textContent='Tirar Foto + Ler Texto (OCR)';
+  BCAP.style.cssText='flex:2;padding:13px;background:#1d4ed8;color:#fff;border:none;font-size:14px;font-weight:700;cursor:pointer;';
   var BCAN=PD.createElement('button');
   BCAN.textContent='Cancelar';
-  BCAN.style.cssText='flex:1;padding:11px;background:#374151;color:#fff;border:none;font-size:14px;font-weight:700;cursor:pointer;';
-  BTNS.appendChild(BOCR); BTNS.appendChild(BCAN);
+  BCAN.style.cssText='flex:1;padding:13px;background:#374151;color:#fff;border:none;font-size:14px;font-weight:600;cursor:pointer;';
+  BTNS.appendChild(BCAP); BTNS.appendChild(BCAN);
   ROOT.appendChild(VWRAP); ROOT.appendChild(ST); ROOT.appendChild(ZBAR); ROOT.appendChild(BTNS);
   PD.body.appendChild(ROOT);
 
-  // CAP, jsQR e Tesseract carregam no IFRAME (sem CSP da pagina pai)
+  // CAP e bibliotecas carregam no IFRAME (sem CSP da pagina pai)
   var CAP=document.createElement('canvas');
-  var stream,scanT,animT,GR={},found=false,LY=0,LD=1,qrFn=null;
+  var stream,scanT,animT,GR={},found=false,LY=0,LD=1,qrFn=null,BDinst=null;
 
   function DONE(v){
     found=true; clearInterval(scanT); clearInterval(animT);
@@ -70,14 +70,15 @@ new Promise(function(RESOLVE){
   .then(function(s){stream=s; VID.srcObject=s; return VID.play();})
   .then(function(){
     setTimeout(RZ,200); animT=setInterval(DRAW,30);
-    setTimeout(function(){
-      loadQR(function(QR){ qrFn=QR; startScan(); });
-    },300);
-  }).catch(function(e){ST.textContent='Erro camera: '+e.message; ST.style.color='#ef4444';});
-
-  function startScan(){
-    clearInterval(scanT);
-    ST.textContent='Procurando codigo...'; ST.style.color='#00e676';
+    // BarcodeDetector nativo — auto-deteccao sem CDN
+    var BDC=window.BarcodeDetector||window.parent.BarcodeDetector;
+    if(BDC){ try{BDinst=new BDC();}catch(e){} }
+    // jsQR em background como fallback para QR codes
+    var s=document.createElement('script');
+    s.src='https://unpkg.com/jsqr@1.4.0/dist/jsQR.min.js';
+    s.onload=function(){qrFn=window.jsQR||null;};
+    document.head.appendChild(s);
+    // Scan passivo (auto-detecta silenciosamente, sem spinner)
     scanT=setInterval(function(){
       if(found||!VID.videoWidth||!GR.vw) return;
       var cv=CROP();
@@ -86,17 +87,13 @@ new Promise(function(RESOLVE){
         var q=qrFn(d.data,d.width,d.height,{inversionAttempts:'dontInvert'});
         if(q&&!found){DONE({type:'barcode',value:q.data}); return;}
       }
-      if('BarcodeDetector' in window){
-        new BarcodeDetector().detect(cv)
-          .then(function(cs){if(cs.length&&!found)DONE({type:'barcode',value:cs[0].rawValue});})
-          .catch(function(){});
-      } else if('BarcodeDetector' in window.parent){
-        new window.parent.BarcodeDetector().detect(cv)
-          .then(function(cs){if(cs.length&&!found)DONE({type:'barcode',value:cs[0].rawValue});})
-          .catch(function(){});
+      if(BDinst){
+        BDinst.detect(cv).then(function(cs){
+          if(cs.length&&!found)DONE({type:'barcode',value:cs[0].rawValue});
+        }).catch(function(){});
       }
-    },200);
-  }
+    },300);
+  }).catch(function(e){ST.textContent='Erro camera: '+e.message; ST.style.color='#ef4444';});
 
   function RZ(){
     var r=VID.getBoundingClientRect(); if(!r.width)return;
@@ -136,18 +133,17 @@ new Promise(function(RESOLVE){
     cv.getContext('2d').drawImage(VID,0,0);
     return cv;
   }
-  function loadQR(cb){
-    if(window.jsQR){cb(window.jsQR); return;}
-    var s=document.createElement('script');
-    s.src='https://unpkg.com/jsqr@1.4.0/dist/jsQR.min.js';
-    s.onload=function(){cb(window.jsQR||null);}; s.onerror=function(){cb(null);};
-    document.head.appendChild(s);
-  }
 
-  BOCR.addEventListener('click',async function(){
-    clearInterval(scanT);
+  // Botao principal: congela frame e roda OCR na imagem estatica
+  BCAP.addEventListener('click',async function(){
+    if(found||BCAP.disabled) return;
+    BCAP.disabled=true; BCAP.textContent='Aguarde...';
+    clearInterval(scanT); clearInterval(animT);
+    // Captura frame completo e pausa video (exibe ultimo frame congelado)
+    var dataUrl=CROP_FULL().toDataURL('image/jpeg',.92);
+    VID.pause();
     ST.textContent='Carregando OCR...'; ST.style.color='#00e676';
-    var dataUrl=CROP_FULL().toDataURL('image/jpeg',.95);
+    // Carrega Tesseract no IFRAME (sem restricao CSP do pai)
     var Tes=window.Tesseract;
     if(!Tes){
       try{
@@ -158,23 +154,31 @@ new Promise(function(RESOLVE){
           document.head.appendChild(s);
         });
         Tes=window.Tesseract;
-      }catch(le){
-        ST.textContent='Erro OCR: '+le.message; ST.style.color='#ef4444';
-        startScan(); return;
-      }
+      }catch(le){ ST.textContent='Erro: '+le.message; ST.style.color='#ef4444'; resetCam(); return; }
     }
-    if(!Tes){ST.textContent='OCR indisponivel'; ST.style.color='#ef4444'; startScan(); return;}
-    ST.textContent='Processando OCR...';
+    if(!Tes){ ST.textContent='OCR indisponivel'; ST.style.color='#ef4444'; resetCam(); return; }
+    ST.textContent='Lendo texto na imagem...';
     try{
       var w=await Tes.createWorker('eng');
       var r=await w.recognize(dataUrl); await w.terminate();
       var txt=r.data.text.replace(/\\s+/g,' ').trim();
-      if(txt){DONE({type:'ocr',value:txt});}
-      else{ST.textContent='Sem texto detectado. Ajuste zoom.'; ST.style.color='#f59e0b'; startScan();}
-    }catch(e){
-      ST.textContent='Erro OCR: '+e.message; ST.style.color='#ef4444'; startScan();
-    }
+      if(txt){ DONE({type:'ocr',value:txt}); }
+      else{ ST.textContent='Nenhum texto. Tente novamente.'; ST.style.color='#f59e0b'; resetCam(); }
+    }catch(e){ ST.textContent='OCR erro: '+e.message; ST.style.color='#ef4444'; resetCam(); }
   });
+
+  function resetCam(){
+    VID.play(); BCAP.disabled=false; BCAP.textContent='Tirar Foto + Ler Texto (OCR)';
+    ST.textContent='Aponte a camera. Codigo de barras detecta automatico.'; ST.style.color='#94a3b8';
+    animT=setInterval(DRAW,30);
+    scanT=setInterval(function(){
+      if(found||!VID.videoWidth||!GR.vw) return;
+      var cv=CROP();
+      if(qrFn){var d=cv.getContext('2d').getImageData(0,0,cv.width,cv.height); var q=qrFn(d.data,d.width,d.height,{inversionAttempts:'dontInvert'}); if(q&&!found){DONE({type:'barcode',value:q.data}); return;}}
+      if(BDinst){BDinst.detect(cv).then(function(cs){if(cs.length&&!found)DONE({type:'barcode',value:cs[0].rawValue});}).catch(function(){});}
+    },300);
+  }
+
   PD.getElementById('_bzmr').addEventListener('input',async function(){
     if(!stream)return;
     var track=stream.getVideoTracks()[0];
