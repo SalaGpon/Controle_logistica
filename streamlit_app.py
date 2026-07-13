@@ -284,7 +284,7 @@ tab_nova, tab_hist = st.tabs(["📋 Nova Conferência", "📊 Histórico"])
 # ABA 1 — NOVA CONFERÊNCIA
 # ════════════════════════════════════════════════════════════════════════════
 with tab_nova:
-    st.title("ONT DE REVERSA — ITEM ATÉ 20")
+    st.title("ONT DE REVERSA")
 
     sups = _supervisores()
     sup_sel = st.selectbox("Supervisor", [""] + sups, key="nova_sup")
@@ -309,9 +309,9 @@ with tab_nova:
 
     # ── Inicializa estado dos itens ─────────────────────────────────────────
     for i in range(1, 21):
-        st.session_state.setdefault(f"serial_{i}", "")
         st.session_state.setdefault(f"scan_on_{i}", False)
         st.session_state.setdefault(f"scan_cnt_{i}", 0)
+        st.session_state.setdefault(f"scan_pending_{i}", "")  # valor OCR a injetar antes do widget
         st.session_state.setdefault(f"foto_b64_{i}", None)
         st.session_state.setdefault(f"foto_hash_{i}", "")
 
@@ -323,13 +323,15 @@ with tab_nova:
 
             # ── Serial + botão scan ────────────────────────────────────────
             col_s, col_btn = st.columns([5, 1])
-            serial_val = col_s.text_input(
+            # Injeta valor pendente do OCR ANTES do widget renderizar
+            if st.session_state[f"scan_pending_{i}"]:
+                st.session_state[f"si_{i}"] = st.session_state[f"scan_pending_{i}"]
+                st.session_state[f"scan_pending_{i}"] = ""
+            col_s.text_input(
                 "Serial / código",
-                value=st.session_state[f"serial_{i}"],
                 key=f"si_{i}",
                 placeholder="Digite ou use 📷 para escanear",
             )
-            st.session_state[f"serial_{i}"] = serial_val
 
             btn_lbl = "✖ Fechar" if st.session_state[f"scan_on_{i}"] else "📷 Scan"
             if col_btn.button(btn_lbl, key=f"scanbtn_{i}"):
@@ -346,8 +348,8 @@ with tab_nova:
                     rtype = (result.get("type") or "") if isinstance(result, dict) else ""
                     rval  = (result.get("value") or "").strip() if isinstance(result, dict) else ""
                     if rtype in ("barcode", "ocr") and rval:
-                        st.session_state[f"serial_{i}"] = rval
-                        st.session_state[f"si_{i}"] = rval  # atualiza o widget
+                        # Guarda como pendente: será injetado no widget no próximo run
+                        st.session_state[f"scan_pending_{i}"] = rval
                     st.rerun()
 
             # ── Foto: somente upload ───────────────────────────────────────
@@ -371,7 +373,7 @@ with tab_nova:
             verificado = st.checkbox("✅ Item verificado", key=f"veri_{i}")
             itens_state.append({
                 "id": i,
-                "serial": st.session_state[f"serial_{i}"],
+                "serial": st.session_state.get(f"si_{i}", ""),
                 "verificado": verificado,
                 "foto_b64": st.session_state[f"foto_b64_{i}"],
             })
@@ -418,7 +420,7 @@ with tab_nova:
         if ok:
             st.success("✅ Conferência salva!")
             for i in range(1, 21):
-                for k in (f"serial_{i}", f"foto_b64_{i}", f"foto_hash_{i}", f"si_{i}"):
+                for k in (f"si_{i}", f"foto_b64_{i}", f"foto_hash_{i}", f"scan_pending_{i}"):
                     st.session_state.pop(k, None)
                 st.session_state[f"scan_on_{i}"] = False
                 st.session_state[f"scan_cnt_{i}"] = 0
