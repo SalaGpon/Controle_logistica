@@ -47,7 +47,10 @@ new Promise(function(RESOLVE){
   BCAN.textContent='Cancelar';
   BCAN.style.cssText='flex:1;padding:16px;background:#374151;color:#fff;border:none;font-size:14px;cursor:pointer;';
   BTNS.appendChild(BOCR); BTNS.appendChild(BCAN);
-  ROOT.appendChild(VWRAP); ROOT.appendChild(ST); ROOT.appendChild(BTNS);
+  var ZBAR=PD.createElement('div');
+  ZBAR.style.cssText='background:#111;padding:5px 12px;display:flex;align-items:center;gap:8px;';
+  ZBAR.innerHTML='<span style="color:#64748b;font-size:11px;white-space:nowrap;">Zoom −</span><input id="_bzmr" type="range" min="1" max="100" value="20" style="flex:1;accent-color:#10b981;"><span style="color:#64748b;font-size:11px;">+</span>';
+  ROOT.appendChild(VWRAP); ROOT.appendChild(ZBAR); ROOT.appendChild(ST); ROOT.appendChild(BTNS);
   PD.body.appendChild(ROOT);
 
   var stream,scanT,animT,GR={},found=false,LY=0,LD=1,BDinst=null,qrFn=null;
@@ -196,6 +199,12 @@ new Promise(function(RESOLVE){
     },300);
   }
 
+  PD.getElementById('_bzmr').addEventListener('input',async function(){
+    if(!stream)return;
+    var track=stream.getVideoTracks()[0];
+    var cap=track.getCapabilities?track.getCapabilities():{};
+    if(cap.zoom){var z=cap.zoom; await track.applyConstraints({advanced:[{zoom:z.min+(z.max-z.min)*(this.value/100)}]}).catch(function(){});}
+  });
   BCAN.addEventListener('click',function(){DONE({type:'cancel'});});
   window.addEventListener('resize',RZ);
 })
