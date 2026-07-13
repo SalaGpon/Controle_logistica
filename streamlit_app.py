@@ -90,7 +90,7 @@ new Promise(function(RESOLVE){
     var r=VID.getBoundingClientRect(); if(!r.width)return;
     OV.width=r.width; OV.height=r.height;
     // Retangulo largo (88% da largura) e alto o suficiente para etiqueta de serial
-    var gw=Math.round(r.width*.88), gh=Math.round(r.height*.24);
+    var gw=Math.round(r.width*.88), gh=Math.round(r.height*.12);
     GR={x:Math.round((r.width-gw)/2),y:Math.round((r.height-gh)/2),w:gw,h:gh,vw:r.width,vh:r.height};
   }
 
@@ -210,6 +210,87 @@ new Promise(function(RESOLVE){
 })
 """
 
+# ── Câmera de foto com zoom + geolocalização ────────────────────────────────
+_PHOTO_JS = """
+new Promise(function(RESOLVE){
+  var PD=window.parent.document;
+  var old=PD.getElementById('_bphoto'); if(old)old.remove();
+  var ROOT=PD.createElement('div');
+  ROOT.id='_bphoto';
+  ROOT.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;background:#000;z-index:2147483647;display:flex;flex-direction:column;font-family:-apple-system,sans-serif;';
+  var VID=PD.createElement('video');
+  VID.autoplay=true; VID.playsInline=true; VID.muted=true;
+  VID.style.cssText='flex:1;width:100%;object-fit:cover;display:block;min-height:0;';
+  var ST=PD.createElement('div');
+  ST.style.cssText='padding:9px 14px;text-align:center;font-size:13px;color:#94a3b8;background:rgba(0,0,0,.92);';
+  ST.textContent='Ajuste o zoom e enquadre o equipamento';
+  var ZBAR=PD.createElement('div');
+  ZBAR.style.cssText='background:#111;padding:5px 12px;display:flex;align-items:center;gap:8px;';
+  ZBAR.innerHTML='<span style="color:#64748b;font-size:11px;white-space:nowrap;">Zoom −</span><input id="_pzmr" type="range" min="1" max="100" value="10" style="flex:1;accent-color:#f59e0b;"><span style="color:#64748b;font-size:11px;">+</span>';
+  var BTNS=PD.createElement('div');
+  BTNS.style.display='flex';
+  var BFOTO=PD.createElement('button');
+  BFOTO.textContent='Tirar Foto';
+  BFOTO.style.cssText='flex:2;padding:16px;background:#d97706;color:#fff;border:none;font-size:16px;font-weight:700;cursor:pointer;';
+  var BCAN=PD.createElement('button');
+  BCAN.textContent='Cancelar';
+  BCAN.style.cssText='flex:1;padding:16px;background:#374151;color:#fff;border:none;font-size:14px;cursor:pointer;';
+  BTNS.appendChild(BFOTO); BTNS.appendChild(BCAN);
+  ROOT.appendChild(VID); ROOT.appendChild(ST); ROOT.appendChild(ZBAR); ROOT.appendChild(BTNS);
+  PD.body.appendChild(ROOT);
+
+  var stream;
+  function DONE(v){
+    if(stream) stream.getTracks().forEach(function(t){t.stop();});
+    ROOT.remove();
+    window.postMessage({_bphotoRes:v},'*');
+  }
+  window.addEventListener('message',function H(e){
+    if(e.data&&e.data._bphotoRes!==undefined){window.removeEventListener('message',H); RESOLVE(e.data._bphotoRes);}
+  });
+
+  // Câmera traseira em máxima resolução disponível
+  navigator.mediaDevices.getUserMedia({
+    video:{facingMode:{ideal:'environment'},width:{ideal:4096},height:{ideal:2160}}
+  }).then(function(s){
+    stream=s; VID.srcObject=s; return VID.play();
+  }).catch(function(e){ST.textContent='Erro camera: '+e.message; ST.style.color='#ef4444';});
+
+  PD.getElementById('_pzmr').addEventListener('input',async function(){
+    if(!stream)return;
+    var track=stream.getVideoTracks()[0];
+    var cap=track.getCapabilities?track.getCapabilities():{};
+    if(cap.zoom){var z=cap.zoom; await track.applyConstraints({advanced:[{zoom:z.min+(z.max-z.min)*(this.value/100)}]}).catch(function(){});}
+  });
+
+  BFOTO.addEventListener('click',async function(){
+    if(BFOTO.disabled) return;
+    BFOTO.disabled=true; BFOTO.textContent='Capturando...';
+    ST.style.color='#f59e0b';
+    // Captura frame em resolução máxima do sensor
+    var cv=document.createElement('canvas');
+    cv.width=VID.videoWidth||1920; cv.height=VID.videoHeight||1080;
+    cv.getContext('2d').drawImage(VID,0,0);
+    var dataUrl=cv.toDataURL('image/jpeg',0.96);
+    var ts=new Date().toLocaleString('pt-BR');
+    ST.textContent='Obtendo localizacao...';
+    var geo=null;
+    try{
+      geo=await new Promise(function(res){
+        navigator.geolocation.getCurrentPosition(
+          function(p){res({lat:p.coords.latitude.toFixed(6),lon:p.coords.longitude.toFixed(6),acc:Math.round(p.coords.accuracy)});},
+          function(){res(null);},
+          {timeout:7000,enableHighAccuracy:true,maximumAge:0}
+        );
+      });
+    }catch(e){}
+    DONE({type:'photo',dataUrl:dataUrl,geo:geo,ts:ts,w:cv.width,h:cv.height});
+  });
+
+  BCAN.addEventListener('click',function(){DONE({type:'cancel'});});
+})
+"""
+
 # ── Conexão ─────────────────────────────────────────────────────────────────
 
 @st.cache_resource
@@ -311,9 +392,12 @@ with tab_nova:
     for i in range(1, 21):
         st.session_state.setdefault(f"scan_on_{i}", False)
         st.session_state.setdefault(f"scan_cnt_{i}", 0)
-        st.session_state.setdefault(f"scan_pending_{i}", "")  # valor OCR a injetar antes do widget
+        st.session_state.setdefault(f"scan_pending_{i}", "")
         st.session_state.setdefault(f"foto_b64_{i}", None)
-        st.session_state.setdefault(f"foto_hash_{i}", "")
+        st.session_state.setdefault(f"foto_geo_{i}", None)
+        st.session_state.setdefault(f"foto_ts_{i}", "")
+        st.session_state.setdefault(f"foto_on_{i}", False)
+        st.session_state.setdefault(f"foto_cnt_{i}", 0)
 
     st.subheader("Itens")
     itens_state = []
@@ -352,23 +436,49 @@ with tab_nova:
                         st.session_state[f"scan_pending_{i}"] = rval
                     st.rerun()
 
-            # ── Foto: somente upload ───────────────────────────────────────
+            # ── Foto: câmera com zoom + geo ────────────────────────────────
             st.caption("Foto do equipamento (opcional)")
-            upload = st.file_uploader(
-                "Selecionar foto",
+            col_fb, col_fup = st.columns([1, 1])
+            foto_lbl = "🔄 Nova Foto" if st.session_state[f"foto_b64_{i}"] else "📷 Tirar Foto"
+            if col_fb.button(foto_lbl, key=f"fotobtn_{i}", use_container_width=True):
+                st.session_state[f"foto_on_{i}"] = not st.session_state[f"foto_on_{i}"]
+                if st.session_state[f"foto_on_{i}"]:
+                    st.session_state[f"foto_cnt_{i}"] += 1
+                st.rerun()
+
+            if st.session_state[f"foto_on_{i}"] and _HAS_JS:
+                foto_key = f"foto_{i}_{st.session_state[f'foto_cnt_{i}']}"
+                foto_res = _js_eval(js_expressions=_PHOTO_JS, key=foto_key)
+                if foto_res is not None:
+                    st.session_state[f"foto_on_{i}"] = False
+                    if isinstance(foto_res, dict) and foto_res.get("type") == "photo":
+                        st.session_state[f"foto_b64_{i}"] = foto_res.get("dataUrl")
+                        st.session_state[f"foto_geo_{i}"] = foto_res.get("geo")
+                        st.session_state[f"foto_ts_{i}"] = foto_res.get("ts", "")
+                    st.rerun()
+
+            # Upload como alternativa
+            upload = col_fup.file_uploader(
+                "ou enviar arquivo",
                 type=["jpg", "jpeg", "png"],
                 key=f"fotoup_{i}",
-                label_visibility="collapsed",
+                label_visibility="visible",
             )
             if upload:
                 raw_foto = upload.read()
-                fh = hashlib.md5(raw_foto).hexdigest()[:10]
-                if fh != st.session_state[f"foto_hash_{i}"]:
-                    st.session_state[f"foto_b64_{i}"] = _img_to_b64(raw_foto)
-                    st.session_state[f"foto_hash_{i}"] = fh
+                st.session_state[f"foto_b64_{i}"] = _img_to_b64(raw_foto)
+                st.session_state[f"foto_geo_{i}"] = None
+                st.session_state[f"foto_ts_{i}"] = ""
 
             if st.session_state[f"foto_b64_{i}"]:
-                st.image(st.session_state[f"foto_b64_{i}"], width=180)
+                st.image(st.session_state[f"foto_b64_{i}"], use_container_width=True)
+                g = st.session_state.get(f"foto_geo_{i}")
+                ts = st.session_state.get(f"foto_ts_{i}", "")
+                if g and g.get("lat"):
+                    maps_url = f"https://www.google.com/maps?q={g['lat']},{g['lon']}"
+                    st.caption(f"📍 {g['lat']}, {g['lon']} (±{g.get('acc','?')}m)  ·  🕐 {ts}  ·  [ver no mapa]({maps_url})")
+                elif ts:
+                    st.caption(f"🕐 {ts}")
 
             verificado = st.checkbox("✅ Item verificado", key=f"veri_{i}")
             itens_state.append({
@@ -376,6 +486,8 @@ with tab_nova:
                 "serial": st.session_state.get(f"si_{i}", ""),
                 "verificado": verificado,
                 "foto_b64": st.session_state[f"foto_b64_{i}"],
+                "geo": st.session_state.get(f"foto_geo_{i}"),
+                "foto_ts": st.session_state.get(f"foto_ts_{i}", ""),
             })
 
     # ── Assinaturas ─────────────────────────────────────────────────────────
@@ -420,10 +532,12 @@ with tab_nova:
         if ok:
             st.success("✅ Conferência salva!")
             for i in range(1, 21):
-                for k in (f"si_{i}", f"foto_b64_{i}", f"foto_hash_{i}", f"scan_pending_{i}"):
+                for k in (f"si_{i}", f"foto_b64_{i}", f"foto_geo_{i}", f"foto_ts_{i}", f"scan_pending_{i}"):
                     st.session_state.pop(k, None)
                 st.session_state[f"scan_on_{i}"] = False
                 st.session_state[f"scan_cnt_{i}"] = 0
+                st.session_state[f"foto_on_{i}"] = False
+                st.session_state[f"foto_cnt_{i}"] = 0
             st.cache_data.clear()
 
 
@@ -482,10 +596,13 @@ with tab_hist:
                 itens = itens_raw if isinstance(itens_raw, list) else json.loads(itens_raw)
                 rows_it = []
                 for it in itens:
+                    g = it.get("geo") or {}
                     rows_it.append({
                         "#": it.get("id"),
                         "Serial": it.get("serial") or "—",
                         "Verificado": "✅" if it.get("verificado") else "❌",
+                        "Localização": f"{g['lat']}, {g['lon']}" if g.get("lat") else "—",
+                        "Data/Hora foto": it.get("foto_ts") or "—",
                     })
                 df_it = pd.DataFrame(rows_it)
                 ok_n = (df_it["Verificado"] == "✅").sum()
